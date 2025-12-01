@@ -57,6 +57,10 @@ class FanMTLCrawler(Crawler):
                 return soup
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code
+                if status_code == 404:
+                    # PERMANENT FAILURE: Return empty content immediately
+                    logger.error(f"Permanent Error (404) detected during TOC fetch: {url}. Skipping.")
+                    return self.make_soup("<html><body></body></html>") # Return empty soup to proceed
                 if status_code == 403:
                     raise Exception(f"{HALT_403_SIGNAL}: 403 Forbidden. Manual restart required.")
                 if status_code == 429:
@@ -74,7 +78,7 @@ class FanMTLCrawler(Crawler):
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
-        soup = self.get_soup_safe(self.novel_url) # Use Safe Getter
+        soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
         if possible_title:
@@ -117,10 +121,9 @@ class FanMTLCrawler(Crawler):
                 wjm_params = query.get("wjm", [""])
                 wjm = wjm_params[0]
 
-                # Fetch pages sequentially to prevent errors from massive parallel requests
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    page_soup = self.get_soup_safe(url) # Use Safe Getter
+                    page_soup = self.get_soup_safe(url)
                     self.parse_chapter_list(page_soup)
                     
             except Exception as e:
@@ -142,7 +145,6 @@ class FanMTLCrawler(Crawler):
             except: pass
 
     def download_chapter_body(self, chapter):
-        # Counter for soft failures (e.g., empty content)
         empty_retry_count = 0 
         
         while True:
@@ -167,8 +169,7 @@ class FanMTLCrawler(Crawler):
                         f"Chapter body for {chapter['title']} is confirmed empty after 3 attempts. "
                         "Marking as successful and proceeding."
                     )
-                    # Return a placeholder. This ensures chapter.success is True 
-                    # for the book integrity check to pass.
+                    # Return placeholder to mark success=True for the integrity check
                     return "<p><i>[Chapter content unavailable from source]</i></p>"
 
                 # 3. SOFT FAILURE: Wait and retry.
@@ -177,12 +178,17 @@ class FanMTLCrawler(Crawler):
                     f"Empty content detected for {chapter['title']} (Attempt {empty_retry_count}/3). "
                     "Waiting 3 seconds and retrying..."
                 )
-                time.sleep(3) # Wait exactly 3 seconds
-                continue # Loop back to retry fetching the chapter
+                time.sleep(3)
+                continue 
                 
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code
                 
+                if status_code == 404:
+                    # FIX: Permanent error. Mark as broken and move on.
+                    logger.error(f"Permanent Error (404) detected on chapter: {chapter['title']}. Skipping.")
+                    return "<p><i>[Chapter link is broken (Error 404)]</i></p>" # Mark as success=True and proceed
+
                 if status_code == 403:
                     # HALT SIGNAL: Stops the entire process
                     logger.critical(f"Permanent Ban (403) detected on chapter: {chapter['title']}")
@@ -194,7 +200,7 @@ class FanMTLCrawler(Crawler):
                     time.sleep(60)
                     continue
                     
-                # Other HTTP errors (500, etc.)
+                # Other HTTP errors (500, 502, 503, 504 are handled by Retry adapter, or catch here)
                 logger.warning(f"HTTP Error {status_code} for {chapter['title']}. Retrying in 15 seconds...")
                 time.sleep(15)
                 continue
