@@ -73,6 +73,8 @@ def scrape_logic_worker(url, progress_queue):
         app.prepare_search()
         app.get_novel_info()
         
+        # NOTE: THREADS_PER_NOVEL is overridden here. Ensure this value is 1 or 2 
+        # to avoid RAM spikes caused by cloudscraper/requests.
         if app.crawler: 
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
@@ -97,17 +99,24 @@ def scrape_logic_worker(url, progress_queue):
         total = len(app.chapters)
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
+        # NOTE: app.start_download now performs the integrity check and 403/429 handling.
         for i, _ in enumerate(app.start_download()):
+            # If the process was halted by a 403 error, app.novel_status will be "HALTED"
+            if app.novel_status == "HALTED":
+                # Raise an error to break out of the multiprocessing loop
+                raise Exception(f"HALTED: {app.novel_status}")
+
             if i % 50 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
-        failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
-        if failed:
-            if progress_queue: progress_queue.put(f"⚠️ Fixing {len(failed)} chapters...")
-            app.crawler.download_chapters(failed)
-            failed = [c for c in app.chapters if not c.body or len(c.body.strip()) < 20]
-            for c in failed: c.body = f"<h1>Chapter {c.id}</h1><p><i>[Content Missing]</i></p>"
+        # No extra fixing needed here, as the integrity check in app.start_download handles it.
+        # However, we must ensure that chapters with empty content (Error 404/Empty after 3 attempts)
+        # are still marked with placeholder content for binding. This is handled by the crawler's download_chapter_body function.
 
+        if app.novel_status != "COMPLETED":
+            # This catches the scenario where download_chapters finished but status is FAILED
+            raise Exception(f"Download completed with FAILED status.")
+        
         if progress_queue: progress_queue.put("📦 Binding...")
         
         try:
@@ -117,6 +126,7 @@ def scrape_logic_worker(url, progress_queue):
         return None
 
     except Exception as e:
+        # Pass the exception up to the main process
         raise e
     finally: 
         app.destroy()
@@ -506,21 +516,37 @@ class NovelBot:
                     return
 
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
+                    # --- LARGE FILE FIX: SEND TO PM, THEN FORWARD ---
                     prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
                     try:
-                        await self.userbot.send_document(
-                            chat_id=int(dest_chat_id),
+                        # 1. Get the Bot's User ID (The Bot's Private Message is the target)
+                        me = await bot.get_me()
+                        bot_user_id = me.id 
+                        
+                        # 2. Upload to BOT'S PM using the Userbot (Pyrogram)
+                        userbot_upload_message = await self.userbot.send_document(
+                            chat_id=bot_user_id, 
                             document=epub_path,
                             caption=caption,
-                            message_thread_id=dest_topic_id
+                            # message_thread_id is OMITTED, resolving the error.
                         )
+
+                        # 3. Forward the message using the Bot API (which supports topic_id)
+                        await bot.forward_message(
+                            chat_id=dest_chat_id, 
+                            message_thread_id=dest_topic_id, 
+                            from_chat_id=bot_user_id,
+                            message_id=userbot_upload_message.id
+                        )
+
                         await prog_msg.delete()
                         self.save_success(url)
                     except Exception as e:
                         await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
+                        self.save_error(url, f"Userbot Upload Failed: {e}")
                 else:
-                    if file_size_mb >= 50:
-                        await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds 50MB limit and Userbot is not active/configured.")
+                    if file_size_mb >= 50 and file_size_mb > USERBOT_THRESHOLD:
+                        await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds {USERBOT_THRESHOLD}MB limit and Userbot is not active/configured.")
                         self.save_error(url, "File > 50MB & No Userbot")
                     else:
                         with open(epub_path, 'rb') as f:
