@@ -58,6 +58,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Dictionary to handle async file uploads between Userbot and Bot
 pending_uploads = {}
 
 # --- WORKER FUNCTION (Global Scope for Multiprocessing) ---
@@ -109,10 +110,6 @@ def scrape_logic_worker(url, progress_queue):
             if i % 50 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
-        # No extra fixing needed here, as the integrity check in app.start_download handles it.
-        # However, we must ensure that chapters with empty content (Error 404/Empty after 3 attempts)
-        # are still marked with placeholder content for binding. This is handled by the crawler's download_chapter_body function.
-
         if app.novel_status != "COMPLETED":
             # This catches the scenario where download_chapters finished but status is FAILED
             raise Exception(f"Download completed with FAILED status.")
@@ -401,6 +398,7 @@ class NovelBot:
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("backup", self.cmd_force_backup))
         app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
+        # Handle files sent to bot PM (Forwarded from userbot)
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
         load_sources()
         app.run_polling()
@@ -425,6 +423,7 @@ class NovelBot:
     async def handle_bot_dm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.message.caption
         if uid and uid in pending_uploads:
+            # Pass the file_id back to the main process logic
             pending_uploads[uid].set_result(update.message.document.file_id)
             del pending_uploads[uid]
 
@@ -515,32 +514,46 @@ class NovelBot:
                     await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
                     return
 
+                # --- UPLOAD LOGIC ---
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
                     # --- LARGE FILE FIX: SEND TO PM, THEN FORWARD ---
                     prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
+                    
+                    uid = uuid.uuid4().hex
+                    upload_future = loop.create_future()
+                    pending_uploads[uid] = upload_future
+
                     try:
-                        # 1. Get the Bot's User ID (The Bot's Private Message is the target)
-                        me = await bot.get_me()
-                        bot_user_id = me.id 
+                        # 1. Resolve Peer to avoid [400 PEER_ID_INVALID]
+                        try:
+                            receiver = await self.userbot.get_users(self.bot_username)
+                        except Exception:
+                            # Fallback if username needs @ prefix or other issue
+                            receiver = await self.userbot.get_users(f"@{self.bot_username}")
                         
                         # 2. Upload to BOT'S PM using the Userbot (Pyrogram)
-                        userbot_upload_message = await self.userbot.send_document(
-                            chat_id=bot_user_id, 
+                        await self.userbot.send_document(
+                            chat_id=receiver.id, # Explicit ID
                             document=epub_path,
-                            caption=caption,
-                            # message_thread_id is OMITTED, resolving the error.
+                            caption=uid
                         )
 
-                        # 3. Forward the message using the Bot API (which supports topic_id)
-                        await bot.forward_message(
+                        # 3. Wait for the main bot to receive the file in handle_bot_dm
+                        file_id = await asyncio.wait_for(upload_future, timeout=600)
+
+                        # 4. Send the file using the retrieved file_id
+                        await bot.send_document(
                             chat_id=dest_chat_id, 
                             message_thread_id=dest_topic_id, 
-                            from_chat_id=bot_user_id,
-                            message_id=userbot_upload_message.id
+                            document=file_id,
+                            caption=caption
                         )
 
                         await prog_msg.delete()
                         self.save_success(url)
+                    except asyncio.TimeoutError:
+                        await self.send_log(bot, "❌ Userbot Upload Timed Out (Bot didn't receive file)", edit_msg=prog_msg)
+                        self.save_error(url, "Userbot Upload Timeout")
                     except Exception as e:
                         await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
                         self.save_error(url, f"Userbot Upload Failed: {e}")
