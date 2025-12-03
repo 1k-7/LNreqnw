@@ -12,8 +12,8 @@ import uuid
 import zipfile
 import datetime
 import multiprocessing
-import requests # Required for connection pool tuning
-from requests.adapters import HTTPAdapter # Required for connection pool tuning
+import requests
+from requests.adapters import HTTPAdapter
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -28,19 +28,21 @@ from pyrogram import Client as UserBotClient
 
 from lncrawl.core.app import App
 from lncrawl.core.sources import load_sources
+from lncrawl.core.arguments import get_args
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("lncrawl").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# [SPEED BOOST] Threads per novel (8 -> 100)
-# We match this with the connection pool size below to ensure 
-# 100 chapters download EXACTLY at the same time.
-THREADS_PER_NOVEL = 100
+# [SPEED OPTIMIZATION]
+# 60 Threads per novel + 10 Concurrent Novels = 600 concurrent requests.
+THREADS_PER_NOVEL = 60
+MAX_CONCURRENT_NOVELS = 10
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -66,13 +68,22 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dictionary to handle async file uploads between Userbot and Bot
 pending_uploads = {}
+
+# --- WORKER INITIALIZER ---
+# Runs ONCE per process to load sources and config. 
+# Saves massive CPU/IO compared to loading per-novel.
+def worker_initializer():
+    load_sources()
+    
+    # Configure global args for this process
+    args = get_args()
+    args.suppress = True
+    args.ignore_images = False # Ensure images are downloaded
 
 # --- WORKER FUNCTION (Global Scope for Multiprocessing) ---
 def scrape_logic_worker(url, progress_queue):
-    # Reload sources in the new process context
-    load_sources()
+    # Note: load_sources() is now handled by worker_initializer
     
     app = App()
     try:
@@ -82,20 +93,18 @@ def scrape_logic_worker(url, progress_queue):
         app.prepare_search()
         app.get_novel_info()
         
-        # [CRITICAL SPEED BOOST]
-        # 1. Initialize Executor with high thread count
-        # 2. Patch the Scraper's Session to allow high concurrency
-        #    Without this, requests defaults to pool_connections=10, 
-        #    meaning 90 out of 100 threads would just sit waiting.
         if app.crawler: 
+            # 1. Initialize High-Thread Executor
             app.crawler.init_executor(THREADS_PER_NOVEL)
-            
-            # Optimization: Inject high-capacity connection adapter
+
+            # 2. Inject Aggressive Connection Pool
+            # This is critical for 60 threads to actually work without blocking
             if hasattr(app.crawler, 'scraper'):
                 adapter = HTTPAdapter(
                     pool_connections=THREADS_PER_NOVEL, 
                     pool_maxsize=THREADS_PER_NOVEL,
-                    max_retries=3
+                    max_retries=3,
+                    pool_block=False
                 )
                 app.crawler.scraper.mount("https://", adapter)
                 app.crawler.scraper.mount("http://", adapter)
@@ -121,14 +130,15 @@ def scrape_logic_worker(url, progress_queue):
         total = len(app.chapters)
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
-        # Start download
-        # Logic: enumerate yields every chapter completion.
-        # We only update queue every 50 to save IPC overhead.
+        # Download Loop
+        count = 0
         for i, _ in enumerate(app.start_download()):
+            count += 1
             if app.novel_status == "HALTED":
                 raise Exception(f"HALTED: {app.novel_status}")
 
-            if i % 50 == 0 and progress_queue: 
+            # Update queue less frequently to save overhead (every 25 chaps)
+            if count % 25 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
         if app.novel_status != "COMPLETED":
@@ -150,9 +160,11 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # [SPEED BOOST] Increased max_workers (2 -> 8)
-        # Allows 8 simultaneous novel tasks.
-        self.executor = ProcessPoolExecutor(max_workers=8)
+        # [SPEED] Use ProcessPool with Initializer
+        self.executor = ProcessPoolExecutor(
+            max_workers=MAX_CONCURRENT_NOVELS,
+            initializer=worker_initializer
+        )
         self.manager = multiprocessing.Manager()
         
         self.userbot = None
@@ -190,7 +202,7 @@ class NovelBot:
                 logger.info("♻️ Migrated processed.json")
             except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
 
-        # --- 2. Load Errors (Legacy) ---
+        # --- 2. Load Errors ---
         if os.path.exists(self.files['errors']):
             try:
                 with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
@@ -252,9 +264,11 @@ class NovelBot:
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
         
+        # Remove from bad lists
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         
+        # Save Processed
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
@@ -346,6 +360,7 @@ class NovelBot:
                 with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
+                # Filter: processed, nullcon, genfail are skipped.
                 to_process = [
                     u for u in urls 
                     if u not in self.processed 
@@ -415,13 +430,15 @@ class NovelBot:
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("backup", self.cmd_force_backup))
         app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
-        # Handle files sent to bot PM (Forwarded from userbot)
+        # Handler for receiving files from Userbot
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
+        
         load_sources()
+        print("🚀 Bot Polling...")
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot (Turbo MAX)** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
+        await update.message.reply_text(f"⚡ **FanMTL Bot (Turbo)** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.processed = set()
@@ -438,6 +455,7 @@ class NovelBot:
         await update.message.reply_text("✅ Backup sent to logs group.")
 
     async def handle_bot_dm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # [HANDSHAKE] Catches file from Userbot, extracts UID from caption, and resolves Future
         uid = update.message.caption
         if uid and uid in pending_uploads:
             pending_uploads[uid].set_result(update.message.document.file_id)
@@ -478,6 +496,7 @@ class NovelBot:
         await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped})")
         
         for url in to_process:
+            # Double check
             if url in self.processed: continue
             await self.process_novel(url, bot)
             gc.collect()
@@ -492,7 +511,7 @@ class NovelBot:
         loop = asyncio.get_running_loop()
         start_time = time.time()
         
-        # ONE SHOT execution
+        # ONE SHOT execution via ProcessPool
         future = loop.run_in_executor(self.executor, scrape_logic_worker, url, progress_queue)
         
         last_text = ""
@@ -529,8 +548,9 @@ class NovelBot:
                     await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
                     return
 
-                # --- UPLOAD LOGIC ---
+                # --- UPLOAD STRATEGY ---
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
+                    # Case 1: Large File -> Userbot Handshake
                     prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
                     
                     uid = uuid.uuid4().hex
@@ -538,23 +558,26 @@ class NovelBot:
                     pending_uploads[uid] = upload_future
 
                     try:
-                        # 1. Resolve Peer to avoid [400 PEER_ID_INVALID]
+                        # 1. Resolve Peer (Avoid PEER_ID_INVALID)
                         try:
+                            # Try resolving by username first
                             receiver = await self.userbot.get_users(self.bot_username)
                         except Exception:
+                            # Fallback if @ is needed
                             receiver = await self.userbot.get_users(f"@{self.bot_username}")
                         
                         # 2. Upload to BOT'S PM using the Userbot
+                        # We send the UID as caption to identify the file in handle_bot_dm
                         await self.userbot.send_document(
-                            chat_id=receiver.id,
+                            chat_id=receiver.id, 
                             document=epub_path,
                             caption=uid
                         )
 
-                        # 3. Wait for the main bot to receive the file in handle_bot_dm
+                        # 3. Wait for the main bot to receive the file in handle_bot_dm and set the future
                         file_id = await asyncio.wait_for(upload_future, timeout=600)
 
-                        # 4. Send the file using the retrieved file_id
+                        # 4. Send the file using the valid file_id (cached on Telegram servers)
                         await bot.send_document(
                             chat_id=dest_chat_id, 
                             message_thread_id=dest_topic_id, 
@@ -570,7 +593,9 @@ class NovelBot:
                     except Exception as e:
                         await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
                         self.save_error(url, f"Userbot Upload Failed: {e}")
+                
                 else:
+                    # Case 2: Small File or No Userbot
                     if file_size_mb >= 50 and file_size_mb > USERBOT_THRESHOLD:
                         await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds {USERBOT_THRESHOLD}MB limit and Userbot is not active/configured.")
                         self.save_error(url, "File > 50MB & No Userbot")
@@ -586,6 +611,7 @@ class NovelBot:
 
                 os.remove(epub_path)
             else:
+                # Genfail (No file)
                 self.genfail.add(url)
                 self.save_genfail()
                 await self.send_log(bot, f"❌ Gen Failed: {url}", edit_msg=status_msg)
