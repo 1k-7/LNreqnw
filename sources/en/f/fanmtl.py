@@ -22,7 +22,7 @@ class FanMTLCrawler(Crawler):
 
     def initialize(self):
         # Reduced max_workers for low RAM usage and stability against 429 errors
-        self.init_executor(2) 
+        self.init_executor(10) 
         
         # Overwrite default scraper (which uses memory-intensive cloudscraper) 
         # with a standard, lightweight requests session.
