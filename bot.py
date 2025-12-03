@@ -12,6 +12,8 @@ import uuid
 import zipfile
 import datetime
 import multiprocessing
+import requests # Required for connection pool tuning
+from requests.adapters import HTTPAdapter # Required for connection pool tuning
 from concurrent.futures import ProcessPoolExecutor
 
 from telegram import Update
@@ -29,13 +31,16 @@ from lncrawl.core.sources import load_sources
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# [SPEED BOOST] Increased threads per novel (8 -> 32)
-# This downloads ~32 chapters in parallel for a single novel.
-THREADS_PER_NOVEL = 32
+# [SPEED BOOST] Threads per novel (8 -> 100)
+# We match this with the connection pool size below to ensure 
+# 100 chapters download EXACTLY at the same time.
+THREADS_PER_NOVEL = 100
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -77,9 +82,23 @@ def scrape_logic_worker(url, progress_queue):
         app.prepare_search()
         app.get_novel_info()
         
-        # [SPEED BOOST] Apply high thread count for aggressive scraping
+        # [CRITICAL SPEED BOOST]
+        # 1. Initialize Executor with high thread count
+        # 2. Patch the Scraper's Session to allow high concurrency
+        #    Without this, requests defaults to pool_connections=10, 
+        #    meaning 90 out of 100 threads would just sit waiting.
         if app.crawler: 
             app.crawler.init_executor(THREADS_PER_NOVEL)
+            
+            # Optimization: Inject high-capacity connection adapter
+            if hasattr(app.crawler, 'scraper'):
+                adapter = HTTPAdapter(
+                    pool_connections=THREADS_PER_NOVEL, 
+                    pool_maxsize=THREADS_PER_NOVEL,
+                    max_retries=3
+                )
+                app.crawler.scraper.mount("https://", adapter)
+                app.crawler.scraper.mount("http://", adapter)
 
         # Cover Image
         if app.crawler.novel_cover:
@@ -102,7 +121,9 @@ def scrape_logic_worker(url, progress_queue):
         total = len(app.chapters)
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
-        # Start download with integrity checks
+        # Start download
+        # Logic: enumerate yields every chapter completion.
+        # We only update queue every 50 to save IPC overhead.
         for i, _ in enumerate(app.start_download()):
             if app.novel_status == "HALTED":
                 raise Exception(f"HALTED: {app.novel_status}")
@@ -129,9 +150,9 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # [SPEED BOOST] Increased max_workers (2 -> 6)
-        # This processes 6 different novels simultaneously.
-        self.executor = ProcessPoolExecutor(max_workers=6)
+        # [SPEED BOOST] Increased max_workers (2 -> 8)
+        # Allows 8 simultaneous novel tasks.
+        self.executor = ProcessPoolExecutor(max_workers=8)
         self.manager = multiprocessing.Manager()
         
         self.userbot = None
@@ -400,7 +421,7 @@ class NovelBot:
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot (Turbo)** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
+        await update.message.reply_text(f"⚡ **FanMTL Bot (Turbo MAX)** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.processed = set()
