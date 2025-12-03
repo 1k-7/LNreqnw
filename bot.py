@@ -32,7 +32,10 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-THREADS_PER_NOVEL = 8
+
+# [SPEED BOOST] Increased threads per novel (8 -> 32)
+# This downloads ~32 chapters in parallel for a single novel.
+THREADS_PER_NOVEL = 32
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 
@@ -74,8 +77,7 @@ def scrape_logic_worker(url, progress_queue):
         app.prepare_search()
         app.get_novel_info()
         
-        # NOTE: THREADS_PER_NOVEL is overridden here. Ensure this value is 1 or 2 
-        # to avoid RAM spikes caused by cloudscraper/requests.
+        # [SPEED BOOST] Apply high thread count for aggressive scraping
         if app.crawler: 
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
@@ -100,18 +102,15 @@ def scrape_logic_worker(url, progress_queue):
         total = len(app.chapters)
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
-        # NOTE: app.start_download now performs the integrity check and 403/429 handling.
+        # Start download with integrity checks
         for i, _ in enumerate(app.start_download()):
-            # If the process was halted by a 403 error, app.novel_status will be "HALTED"
             if app.novel_status == "HALTED":
-                # Raise an error to break out of the multiprocessing loop
                 raise Exception(f"HALTED: {app.novel_status}")
 
             if i % 50 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
         if app.novel_status != "COMPLETED":
-            # This catches the scenario where download_chapters finished but status is FAILED
             raise Exception(f"Download completed with FAILED status.")
         
         if progress_queue: progress_queue.put("📦 Binding...")
@@ -123,7 +122,6 @@ def scrape_logic_worker(url, progress_queue):
         return None
 
     except Exception as e:
-        # Pass the exception up to the main process
         raise e
     finally: 
         app.destroy()
@@ -131,8 +129,9 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # Use ProcessPoolExecutor for CPU isolation
-        self.executor = ProcessPoolExecutor(max_workers=2)
+        # [SPEED BOOST] Increased max_workers (2 -> 6)
+        # This processes 6 different novels simultaneously.
+        self.executor = ProcessPoolExecutor(max_workers=6)
         self.manager = multiprocessing.Manager()
         
         self.userbot = None
@@ -143,7 +142,7 @@ class NovelBot:
         self.errors = {}
         self.nullcon = set()
         self.genfail = set()
-        self.nwerror = set() # Kept for legacy file loading but not used logic-wise
+        self.nwerror = set()
         
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
         self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
@@ -232,11 +231,9 @@ class NovelBot:
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
         
-        # Remove from bad lists
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         
-        # Save Processed
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
@@ -328,7 +325,6 @@ class NovelBot:
                 with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
                 
-                # Filter: processed, nullcon, genfail are skipped.
                 to_process = [
                     u for u in urls 
                     if u not in self.processed 
@@ -404,7 +400,7 @@ class NovelBot:
         app.run_polling()
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"⚡ **FanMTL Bot** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
+        await update.message.reply_text(f"⚡ **FanMTL Bot (Turbo)** ⚡\nProcessed: {len(self.processed)}\nUser: {self.bot_username}")
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.processed = set()
@@ -423,7 +419,6 @@ class NovelBot:
     async def handle_bot_dm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.message.caption
         if uid and uid in pending_uploads:
-            # Pass the file_id back to the main process logic
             pending_uploads[uid].set_result(update.message.document.file_id)
             del pending_uploads[uid]
 
@@ -462,7 +457,6 @@ class NovelBot:
         await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped})")
         
         for url in to_process:
-            # Double check
             if url in self.processed: continue
             await self.process_novel(url, bot)
             gc.collect()
@@ -516,7 +510,6 @@ class NovelBot:
 
                 # --- UPLOAD LOGIC ---
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
-                    # --- LARGE FILE FIX: SEND TO PM, THEN FORWARD ---
                     prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
                     
                     uid = uuid.uuid4().hex
@@ -528,12 +521,11 @@ class NovelBot:
                         try:
                             receiver = await self.userbot.get_users(self.bot_username)
                         except Exception:
-                            # Fallback if username needs @ prefix or other issue
                             receiver = await self.userbot.get_users(f"@{self.bot_username}")
                         
-                        # 2. Upload to BOT'S PM using the Userbot (Pyrogram)
+                        # 2. Upload to BOT'S PM using the Userbot
                         await self.userbot.send_document(
-                            chat_id=receiver.id, # Explicit ID
+                            chat_id=receiver.id,
                             document=epub_path,
                             caption=uid
                         )
@@ -573,21 +565,16 @@ class NovelBot:
 
                 os.remove(epub_path)
             else:
-                # Genfail (No file)
                 self.genfail.add(url)
                 self.save_genfail()
                 await self.send_log(bot, f"❌ Gen Failed: {url}", edit_msg=status_msg)
 
         except Exception as e:
             err_msg = str(e)
-            
-            # Nullcon (IndexError / Empty)
             if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg or "No chapters found" in err_msg:
                 self.nullcon.add(url)
                 self.save_nullcon()
                 await self.send_log(bot, f"⚠️ **Null Content:** {url}", edit_msg=status_msg)
-            
-            # Network/Other (Not Saved)
             else:
                 await self.send_log(bot, f"❌ **Error:** {e}\n{url}", edit_msg=status_msg)
 
