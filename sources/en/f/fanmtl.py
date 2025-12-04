@@ -21,33 +21,35 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # Reduced max_workers for low RAM usage and stability against 429 errors
+        # Reduced max_workers for low RAM usage
         self.init_executor(10) 
         
-        # Overwrite default scraper (which uses memory-intensive cloudscraper) 
-        # with a standard, lightweight requests session.
+        # Standard Session
         self.scraper = requests.Session()
         
-        # Add headers for stability
+        # Standard Browser Headers (NO AJAX HEADERS HERE)
         self.scraper.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         })
 
         self.cleaner.bad_css.update({'div[align="center"]'})
 
-        # Standard retries for network glitches
+        # Retry logic
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        # Match pool size to number of workers
-        adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
         
-    def get_soup_safe(self, url):
-        """Wrapper to pause on errors during novel info / TOC fetching."""
+    def get_soup_safe(self, url, headers=None):
+        """
+        Wrapper to fetch soup with optional specific headers.
+        """
         while True:
             try:
-                response = self.scraper.get(url)
+                # Use session headers by default, or merge/override with specific headers
+                response = self.scraper.get(url, headers=headers)
                 response.raise_for_status()
                 soup = self.make_soup(response)
                 
@@ -58,26 +60,27 @@ class FanMTLCrawler(Crawler):
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code
                 if status_code == 404:
-                    # PERMANENT FAILURE: Return empty content immediately
-                    logger.error(f"Permanent Error (404) detected during TOC fetch: {url}. Skipping.")
-                    return self.make_soup("<html><body></body></html>") # Return empty soup to proceed
+                    logger.error(f"Permanent Error (404) fetching {url}")
+                    return self.make_soup("<html><body></body></html>")
                 if status_code == 403:
-                    raise Exception(f"{HALT_403_SIGNAL}: 403 Forbidden. Manual restart required.")
+                    raise Exception(f"{HALT_403_SIGNAL}: 403 Forbidden.")
                 if status_code == 429:
-                    logger.warning(f"Rate Limit (429) detected during TOC fetch. Sleeping for 60s...")
+                    logger.warning(f"Rate Limit (429). Sleeping 60s...")
                     time.sleep(60)
                     continue
                 
-                logger.warning(f"HTTP Error {status_code} during TOC fetch. Retrying in 15s...")
+                logger.warning(f"HTTP Error {status_code}. Retrying in 15s...")
                 time.sleep(15)
                 continue
             except Exception as e:
-                logger.warning(f"Connection Error during TOC fetch: {e}. Retrying in 10s...")
+                logger.warning(f"Connection Error: {e}. Retrying in 10s...")
                 time.sleep(10)
                 continue
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
+        
+        # 1. Fetch Main Page (Standard Browser Request - No AJAX Header)
         soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -102,13 +105,15 @@ class FanMTLCrawler(Crawler):
 
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
+        self.chapter_urls = set()
 
-        # --- PAGINATION LOGIC ---
+        # 2. Parse Chapters from Main Page (Chapters 1-100 usually)
+        self.parse_chapter_list(soup)
+
+        # 3. Handle Pagination (AJAX Requests)
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
-        if not pagination_links:
-            self.parse_chapter_list(soup)
-        else:
+        if pagination_links:
             try:
                 last_page = pagination_links[-1]
                 href = last_page.get("href")
@@ -121,14 +126,17 @@ class FanMTLCrawler(Crawler):
                 wjm_params = query.get("wjm", [""])
                 wjm = wjm_params[0]
 
+                # Header specifically for pagination scripts (fy.php / fy1.php)
+                ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
+
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    page_soup = self.get_soup_safe(url)
+                    # Fetch with AJAX header
+                    page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
                     
             except Exception as e:
-                logger.error(f"Pagination failed: {e}. Parsing current page.")
-                self.parse_chapter_list(soup)
+                logger.error(f"Pagination logic failed: {e}. Proceeding with extracted chapters.")
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
 
@@ -136,10 +144,15 @@ class FanMTLCrawler(Crawler):
         if not soup: return
         for a in soup.select("ul.chapter-list li a"):
             try:
+                url = self.absolute_url(a["href"])
+                if url in self.chapter_urls:
+                    continue
+                
+                self.chapter_urls.add(url)
                 self.chapters.append(Chapter(
                     id=len(self.chapters) + 1,
                     volume=1,
-                    url=self.absolute_url(a["href"]),
+                    url=url,
                     title=a.select_one(".chapter-title").text.strip(),
                 ))
             except: pass
@@ -149,6 +162,7 @@ class FanMTLCrawler(Crawler):
         
         while True:
             try:
+                # Standard request for chapter body (No AJAX header)
                 response = self.scraper.get(chapter["url"])
                 response.raise_for_status() 
                 
@@ -157,56 +171,27 @@ class FanMTLCrawler(Crawler):
                 
                 content = self.cleaner.extract_contents(body).strip() if body else ""
                 
-                # 1. SUCCESS CHECK: Content found. Return it.
                 if content:
                     return content
                 
-                # --- HANDLE EMPTY CONTENT / SOFT FAILURE ---
-                
-                # 2. CHECK MAX RETRIES (3 attempts total)
                 if empty_retry_count >= 2: 
-                    logger.warning(
-                        f"Chapter body for {chapter['title']} is confirmed empty after 3 attempts. "
-                        "Marking as successful and proceeding."
-                    )
-                    # Return placeholder to mark success=True for the integrity check
                     return "<p><i>[Chapter content unavailable from source]</i></p>"
 
-                # 3. SOFT FAILURE: Wait and retry.
                 empty_retry_count += 1
-                logger.warning(
-                    f"Empty content detected for {chapter['title']} (Attempt {empty_retry_count}/3). "
-                    "Waiting 3 seconds and retrying..."
-                )
-                time.sleep(3)
+                time.sleep(2)
                 continue 
                 
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code
-                
                 if status_code == 404:
-                    # FIX: Permanent error. Mark as broken and move on.
-                    logger.error(f"Permanent Error (404) detected on chapter: {chapter['title']}. Skipping.")
-                    return "<p><i>[Chapter link is broken (Error 404)]</i></p>" # Mark as success=True and proceed
-
+                    return "<p><i>[Chapter link is broken (Error 404)]</i></p>"
                 if status_code == 403:
-                    # HALT SIGNAL: Stops the entire process
-                    logger.critical(f"Permanent Ban (403) detected on chapter: {chapter['title']}")
-                    raise Exception(f"{HALT_403_SIGNAL}: 403 Forbidden. Manual restart required.")
-                
+                    raise Exception(f"{HALT_403_SIGNAL}: 403 Forbidden.")
                 if status_code == 429:
-                    # WAIT & RETRY: Pauses for 60s and keeps trying this chapter
-                    logger.warning(f"Rate Limit (429) detected for {chapter['title']}. Sleeping for 60 seconds and retrying...")
                     time.sleep(60)
                     continue
-                    
-                # Other HTTP errors (500, 502, 503, 504 are handled by Retry adapter, or catch here)
-                logger.warning(f"HTTP Error {status_code} for {chapter['title']}. Retrying in 15 seconds...")
                 time.sleep(15)
                 continue
-
             except Exception as e:
-                # Catch connection errors, timeouts, etc.
-                logger.warning(f"Connection Error for {chapter['title']}: {e}. Retrying in 10 seconds...")
                 time.sleep(10)
                 continue
