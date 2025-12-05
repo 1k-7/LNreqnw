@@ -7,6 +7,7 @@ from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
+from lncrawl.assets.user_agents import user_agents  # <--- Import your new list
 
 logger = logging.getLogger(__name__)
 
@@ -22,48 +23,18 @@ class FanMTLCrawler(Crawler):
         # Reduced max_workers for low RAM usage
         self.init_executor(5) 
         
-        # Hardcoded list of modern User-Agents to rotate through
-        user_agents = [
-            # Chrome on Windows 10/11
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            
-            # Chrome on MacOS
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            
-            # Firefox on Windows
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-            
-            # Firefox on MacOS
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
-            
-            # Edge on Windows
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-            
-            # Safari on MacOS
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        ]
-
-        # Pick one randomly
-        selected_ua = random.choice(user_agents)
-        logger.info(f"FanMTL Random UA: {selected_ua}")
-
-        # Apply headers
+        # [CRITICAL] Randomize User-Agent
+        # This ensures every run looks like a different browser/OS to Cloudflare
+        random_ua = random.choice(user_agents)
+        
         self.scraper.headers.update({
-            "User-Agent": selected_ua,
+            "User-Agent": random_ua,
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
-
+        
+        logger.info(f"FanMTL Strategy: Using User-Agent -> {random_ua[:40]}...")
         self.cleaner.bad_css.update({'div[align="center"]'})
         
     def get_soup_safe(self, url, headers=None):
@@ -144,7 +115,7 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
 
-                # AJAX Header is crucial for pagination ONLY
+                # AJAX Header is crucial for pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
@@ -179,7 +150,7 @@ class FanMTLCrawler(Crawler):
         
         while True:
             try:
-                # Use get_soup_safe to leverage the cloudscraper protection
+                # Use get_soup_safe to leverage the cloudscraper protection + random UA
                 soup = self.get_soup_safe(chapter["url"])
                 body = soup.select_one("#chapter-article .chapter-content")
                 

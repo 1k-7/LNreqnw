@@ -1,4 +1,3 @@
-# lncrawl/core/scraper.py
 import base64
 import logging
 import os
@@ -52,31 +51,28 @@ class Scraper(TaskManager, SoupMaker):
     def init_scraper(self, session: Optional[Session] = None):
         """Check for option: https://github.com/VeNoMouS/cloudscraper"""
         try:
-            # OPTIMAL CONFIGURATION for preventing your specific 403 issues
             self.scraper = create_scraper(
-                # debug=True,
-
-                # KEY SETTINGS to prevent 403 errors
-                min_request_interval=2.0,
-                max_concurrent_requests=1,
-                rotate_tls_ciphers=True,
-
                 # [CRITICAL FIX] Enable auto-refresh to solve Cloudflare challenges
-                auto_refresh_on_403=True,     # CHANGED FROM False
-                max_403_retries=3,            # Give it 3 tries to solve the captcha
-                session_refresh_interval=900,
+                auto_refresh_on_403=True, 
+                max_403_retries=3,             
 
-                # Optimized stealth mode
+                # TLS & Concurrency settings
+                min_request_interval=2.0,      
+                max_concurrent_requests=1,     
+                rotate_tls_ciphers=True,       
+                session_refresh_interval=900,  
+
+                # Stealth Options
                 enable_stealth=True,
                 stealth_options={
-                    'min_delay': 1.0,
+                    'min_delay': 1.0,          
                     'max_delay': 3.0,
                     'human_like_delays': True,
                     'randomize_headers': True,
                     'browser_quirks': True
                 },
 
-                # User agent filtering
+                # Browser Fingerprint
                 browser={
                     'browser': 'chrome',
                     'platform': 'windows',
