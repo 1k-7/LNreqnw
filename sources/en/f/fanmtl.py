@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging
 import time
-import random
+import requests
 from urllib.parse import urlparse, parse_qs
-from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
-# Try to import curl_cffi for the bypass
+# Import the solver (Cloudscraper) and the speed engine (curl_cffi)
+from lncrawl.cloudscraper import create_scraper
 try:
     from curl_cffi import requests as cffi_requests
     HAS_CFFI = True
@@ -24,64 +24,103 @@ class FanMTLCrawler(Crawler):
         if not HAS_CFFI:
             raise Exception("Please install 'curl_cffi' to use this source: pip install curl_cffi")
 
-        # [TURBO] 60-80 threads is safe because we are impersonating a real browser
-        # and not using a slow proxy tunnel.
         self.init_executor(60) 
         
-        # 1. Replace the default scraper with a High-Performance Browser Session
-        # 'impersonate="chrome"' makes the TLS handshake look identical to a real browser.
-        self.scraper = cffi_requests.Session(impersonate="chrome")
+        # 1. Setup the SOLVER (Cloudscraper)
+        # Its only job is to solve the initial JS challenge and get cookies.
+        self.solver = create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True},
+            delay=10
+        )
+
+        # 2. Setup the RUNNER (Curl_CFFI)
+        # This does the actual downloading at high speed.
+        self.runner = cffi_requests.Session(impersonate="chrome120")
         
-        # 2. Add standard headers (User-Agent is handled automatically by impersonate)
-        self.scraper.headers.update({
+        # Sync headers
+        self.runner.headers.update({
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
-            "Upgrade-Insecure-Requests": "1",
         })
-        
-        # 3. Remove all proxies (Use Direct Connection for Max Speed)
-        self.scraper.proxies = {}
-        
-        logger.info(f"FanMTL NATIVE: TLS Impersonation Active (Chrome) | Proxy: Direct (Fast)")
+
+        self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
+        logger.info("FanMTL Strategy: Cookie Handover (Solver -> Turbo Runner)")
+
+    def refresh_cookies(self, url):
+        """
+        Uses the slow Solver to pass Cloudflare, then hands cookies to the fast Runner.
+        """
+        logger.warning("🔒 Encountered Cloudflare. Launching Solver...")
         
+        # 1. Solve with Cloudscraper
+        # This request might take 5-10 seconds while it solves JS
+        resp = self.solver.get(url)
+        
+        if resp.status_code == 403:
+            logger.critical("❌ Solver failed. IP might be strictly banned or Captcha required.")
+            raise Exception("Manual Intervention Required: Cloudflare Blocked Solver")
+            
+        # 2. Extract the 'Golden Ticket' (cf_clearance)
+        cf_cookie = self.solver.cookies.get('cf_clearance')
+        ua = self.solver.headers.get('User-Agent')
+        
+        if not cf_cookie:
+            logger.warning("⚠️ No cf_clearance cookie found, but access seemed OK.")
+            
+        # 3. Inject into Fast Runner
+        if cf_cookie:
+            self.runner.cookies.set('cf_clearance', cf_cookie, domain='.fanmtl.com')
+        
+        # Sync User-Agent to match the solver exactly to avoid mismatch detection
+        if ua:
+            self.runner.headers['User-Agent'] = ua
+            
+        self.cookies_synced = True
+        logger.info("✅ Cookies Handed Over! Switching to Turbo Mode.")
+        return resp
+
     def get_soup_safe(self, url):
         """
-        Wrapper to handle fetching with TLS Impersonation.
+        Smart wrapper that handles the handover automatically.
         """
         retries = 0
         while True:
             try:
-                # Use the cffi scraper directly
-                response = self.scraper.get(url, timeout=10)
+                # STEP 1: Try Fast Runner
+                response = self.runner.get(url, timeout=10)
                 
-                # Handle Cloudflare specific responses
-                if response.status_code in [403, 503]:
-                    if "just a moment" in response.text.lower():
-                        logger.warning(f"Cloudflare Challenge on {url}. Retrying...")
-                        time.sleep(2)
-                        retries += 1
-                        if retries > 5: raise Exception("Cloudflare Loop")
-                        continue
+                # Check if we hit a challenge
+                if response.status_code in [403, 503] and "just a moment" in response.text.lower():
+                    logger.warning("⛔ Turbo session expired. Refreshing cookies...")
+                    self.refresh_cookies(url)
+                    continue # Retry loop with new cookies
 
                 response.raise_for_status()
-                
-                # Use the crawler's soup maker
                 return self.make_soup(response)
 
             except Exception as e:
-                msg = str(e).lower()
-                if "404" in msg:
+                # If it's a 403/503 error, try to refresh cookies once
+                if "403" in str(e) or "503" in str(e):
+                    if retries == 0:
+                        try:
+                            self.refresh_cookies(url)
+                            retries += 1
+                            continue
+                        except: pass
+
+                if "404" in str(e):
                     logger.error(f"Permanent Error (404): {url}")
                     return self.make_soup("<html></html>")
-                
-                # Connection errors or temporary blocks
+
                 logger.warning(f"Request Error: {e}. Retrying in 5s...")
                 time.sleep(5)
                 continue
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
+        
+        # Initial request will likely trigger the Solver immediately
         soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -106,11 +145,9 @@ class FanMTLCrawler(Crawler):
 
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
-        
-        # Parse Current Page
+
         self.parse_chapter_list(soup)
 
-        # Handle Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -118,26 +155,20 @@ class FanMTLCrawler(Crawler):
                 href = last_page.get("href")
                 common_url = self.absolute_url(href).split("?")[0]
                 query = parse_qs(urlparse(href).query)
-                
                 page_params = query.get("page", ["0"])
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
                 
-                # AJAX Header needed for pagination scripts
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    # We must use self.scraper.get directly to pass specific headers here
-                    try:
-                        resp = self.scraper.get(url, headers=ajax_headers, timeout=10)
-                        page_soup = self.make_soup(resp)
-                        self.parse_chapter_list(page_soup)
-                    except Exception as e:
-                        logger.error(f"Pagination fetch failed: {e}")
-
+                    # Pagination requests also use the safe wrapper
+                    page_soup = self.get_soup_safe(url) 
+                    self.parse_chapter_list(page_soup)
+                    
             except Exception as e:
-                logger.error(f"Pagination logic error: {e}")
+                logger.error(f"Pagination failed: {e}")
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
 
@@ -155,40 +186,11 @@ class FanMTLCrawler(Crawler):
             except: pass
 
     def download_chapter_body(self, chapter):
-        """
-        Downloads chapter content using the high-speed TLS-impersonating session.
-        """
-        retries = 0
-        while True:
-            try:
-                # Direct high-speed request
-                response = self.scraper.get(chapter["url"], timeout=10)
-                
-                # Basic error checking
-                if response.status_code == 404:
-                    return "<p><i>[Chapter link is broken (Error 404)]</i></p>"
-                
-                response.raise_for_status()
-                soup = self.make_soup(response)
-                
-                body = soup.select_one("#chapter-article .chapter-content")
-                content = self.cleaner.extract_contents(body).strip() if body else ""
-                
-                if content:
-                    return content
-                
-                if retries >= 2:
-                    return "<p><i>[Chapter content unavailable]</i></p>"
-
-                retries += 1
-                time.sleep(1) # Tiny sleep on soft fail
-                
-            except Exception as e:
-                if "403" in str(e) or "challenge" in str(e).lower():
-                    logger.warning(f"Blocked on {chapter['title']}. Retrying...")
-                    time.sleep(5) # Wait a bit if blocked
-                    continue
-                    
-                logger.warning(f"Error on {chapter['title']}: {e}")
-                time.sleep(2)
-                continue
+        # This uses the runner which stays valid as long as the cookie is alive.
+        # If it expires, get_soup_safe will auto-refresh it.
+        try:
+            soup = self.get_soup_safe(chapter["url"])
+            body = soup.select_one("#chapter-article .chapter-content")
+            return self.cleaner.extract_contents(body).strip() if body else ""
+        except Exception:
+            return ""
