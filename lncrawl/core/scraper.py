@@ -50,25 +50,39 @@ class Scraper(TaskManager, SoupMaker):
         self.make_soup = self._soup_tool.make_soup  # type:ignore
 
     def init_scraper(self, session: Optional[Session] = None):
+        """Check for option: https://github.com/VeNoMouS/cloudscraper"""
         try:
+            # OPTIMAL CONFIGURATION for preventing your specific 403 issues
             self.scraper = create_scraper(
-                # [CHANGED] Enable challenge solving
+                # debug=True,
+
+                # KEY SETTINGS to prevent 403 errors
+                min_request_interval=2.0,
+                max_concurrent_requests=1,
+                rotate_tls_ciphers=True,
+
+                # [CRITICAL FIX] Enable auto-refresh to solve Cloudflare challenges
+                auto_refresh_on_403=True,     # CHANGED FROM False
+                max_403_retries=3,            # Give it 3 tries to solve the captcha
+                session_refresh_interval=900,
+
+                # Optimized stealth mode
+                enable_stealth=True,
+                stealth_options={
+                    'min_delay': 1.0,
+                    'max_delay': 3.0,
+                    'human_like_delays': True,
+                    'randomize_headers': True,
+                    'browser_quirks': True
+                },
+
+                # User agent filtering
                 browser={
                     'browser': 'chrome',
                     'platform': 'windows',
                     'desktop': True,
                     'mobile': False,
                 },
-                # [CHANGED] Allow retries for 403 (Cloudflare challenges)
-                auto_refresh_on_403=True, 
-                max_403_retries=3,
-                
-                # Keep these for stability
-                min_request_interval=1.5,
-                max_concurrent_requests=1,
-                rotate_tls_ciphers=True,
-                
-                enable_stealth=True,
             )
         except Exception:
             logger.exception("Failed to initialize cloudscraper")

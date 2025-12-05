@@ -1,12 +1,12 @@
+# sources/en/f/fanmtl.py
 # -*- coding: utf-8 -*-
 import logging
 import time
 import requests.exceptions
-import requests
+# REMOVED: import requests (not needed, we use self.scraper)
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# REMOVED: HTTPAdapter, Retry (Cloudscraper handles this internaly now)
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
@@ -21,46 +21,39 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # Reduced max_workers for low RAM usage and stability against 429 errors
-        self.init_executor(10) 
+        # Reduced max_workers for low RAM usage
+        self.init_executor(8) 
         
-        # [CRITICAL] Do NOT overwrite self.scraper with requests.Session().
-        # We must use the Cloudscraper instance from the parent Crawler class 
-        # to bypass Cloudflare protection.
-
-        # Add headers (Safe to add Accept-Language, but DO NOT overwrite User-Agent)
+        # [CRITICAL FIX] DO NOT run self.scraper = requests.Session()
+        # We use the existing self.scraper which has Cloudflare protection.
+        
+        # Add headers to the existing scraper
         self.scraper.headers.update({
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.fanmtl.com/", # Helping valid requests
+            "Upgrade-Insecure-Requests": "1",
         })
 
         self.cleaner.bad_css.update({'div[align="center"]'})
-
-        # Standard retries for network glitches
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=retry)
-        self.scraper.mount("https://", adapter)
-        self.scraper.mount("http://", adapter)
         
     def get_soup_safe(self, url, headers=None):
         """Wrapper to pause on errors during novel info / TOC fetching."""
         while True:
             try:
-                # Use self.get_soup which uses the properly configured self.scraper
-                # and handles the AJAX headers correctly if passed.
+                # Use self.get_soup which uses the cloudscraper session
                 soup = self.get_soup(url, headers=headers)
                 
                 if "just a moment" in str(soup.title).lower():
-                    # This means auto_refresh_on_403 failed or hit max retries
-                    raise Exception("Cloudflare Challenge Detected")
+                    raise Exception("Cloudflare Challenge Detected (Auto-solve failed)")
                 
                 return soup
             except Exception as e:
                 msg = str(e).lower()
                 if "404" in msg:
-                    logger.error(f"Permanent Error (404): {url}")
+                    logger.error(f"Permanent Error (404) fetching {url}")
                     return self.make_soup("<html><body></body></html>")
                 
-                if "403" in msg or "challenge detected" in msg:
+                if "403" in msg or "challenge" in msg:
                     logger.critical(f"403 Forbidden/Challenge on {url}. Waiting 60s...")
                     time.sleep(60) 
                     continue 
@@ -77,7 +70,7 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # 1. Main Page (Standard Request - Cloudscraper handles headers)
+        # 1. Main Page
         soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -107,7 +100,7 @@ class FanMTLCrawler(Crawler):
         # 2. Parse initial chapters
         self.parse_chapter_list(soup)
 
-        # 3. Handle Pagination (Requires specific AJAX header)
+        # 3. Handle Pagination (Requires AJAX header)
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
         if pagination_links:
@@ -121,11 +114,12 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
 
-                # Only add this header for these specific requests
+                # AJAX Header is crucial for pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
+                    # Pass headers specifically to get_soup_safe
                     page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
                     
@@ -141,6 +135,7 @@ class FanMTLCrawler(Crawler):
                 url = self.absolute_url(a["href"])
                 if url in self.chapter_urls: continue
                 self.chapter_urls.add(url)
+                
                 self.chapters.append(Chapter(
                     id=len(self.chapters) + 1,
                     volume=1,
@@ -150,7 +145,27 @@ class FanMTLCrawler(Crawler):
             except: pass
 
     def download_chapter_body(self, chapter):
-        # Uses standard scraper.get_soup which handles cookies/headers automatically
-        soup = self.get_soup_safe(chapter["url"])
-        body = soup.select_one("#chapter-article .chapter-content")
-        return self.cleaner.extract_contents(body).strip() if body else ""
+        empty_retry_count = 0 
+        
+        while True:
+            try:
+                # Use get_soup_safe to leverage the cloudscraper protection
+                soup = self.get_soup_safe(chapter["url"])
+                body = soup.select_one("#chapter-article .chapter-content")
+                
+                content = self.cleaner.extract_contents(body).strip() if body else ""
+                
+                if content:
+                    return content
+                
+                if empty_retry_count >= 2: 
+                    return "<p><i>[Chapter content unavailable from source]</i></p>"
+
+                empty_retry_count += 1
+                time.sleep(2)
+                continue 
+                
+            except Exception as e:
+                # Specific exception handling is done inside get_soup_safe
+                # If it bubble up here, it's a major crash or manual halt
+                raise e
