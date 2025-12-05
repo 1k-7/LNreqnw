@@ -2,7 +2,7 @@
 import logging
 import time
 import requests
-from urllib.parse import urlparse, parse_qs  # <--- ADDED MISSING IMPORTS
+from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
@@ -31,7 +31,7 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Force traffic through WARP
+        # Force traffic through WARP (socks5h = Remote DNS resolution)
         self.proxy_url = "socks5h://127.0.0.1:40000"
         self.runner.proxies = {
             "http": self.proxy_url,
@@ -43,36 +43,31 @@ class FanMTLCrawler(Crawler):
         self.runner.mount("https://", adapter)
         self.runner.mount("http://", adapter)
 
+        # Expose runner to the bot for cover downloading
+        self.scraper = self.runner
+
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
         logger.info("FanMTL Strategy: Selenium Solver -> Requests Runner (Stable)")
 
     def refresh_cookies(self, url):
-        """
-        Launches a REAL headless Chrome browser to solve the Cloudflare Challenge.
-        """
+        """Launches a REAL headless Chrome browser to solve the Cloudflare Challenge."""
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
         try:
-            # 1. Configure Chrome to use WARP
             options = ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument(f'--proxy-server={self.proxy_url}')
             
-            # 2. Start Browser (Headless)
             driver = create_local(headless=True, options=options)
             
-            # 3. Visit Page
             driver.get(url)
-            
-            # 4. Wait for Challenge (Just a moment...)
             time.sleep(10)
             if "Just a moment" in driver.title:
                 logger.info("Browser: Solving challenge...")
                 time.sleep(10)
 
-            # 5. Extract Cookies & User-Agent
             cookies = driver.get_cookies()
             ua = driver.execute_script("return navigator.userAgent")
             
@@ -105,16 +100,12 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """
-        Smart wrapper: Fails fast -> Calls Solver -> Retries
-        """
+        """Smart wrapper: Fails fast -> Calls Solver -> Retries"""
         retries = 0
         while True:
             try:
-                # Merge specific headers (like AJAX) with session headers
                 req_headers = self.runner.headers.copy()
-                if headers:
-                    req_headers.update(headers)
+                if headers: req_headers.update(headers)
 
                 # STEP 1: Try Fast Runner
                 response = self.runner.get(url, headers=req_headers, timeout=15)
@@ -150,7 +141,6 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # Trigger solver on first load
         soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -185,17 +175,14 @@ class FanMTLCrawler(Crawler):
                 href = last_page.get("href")
                 common_url = self.absolute_url(href).split("?")[0]
                 query = parse_qs(urlparse(href).query)
-                
                 page_params = query.get("page", ["0"])
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
                 
-                # AJAX Header is required for pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    # Pass AJAX header to get_soup_safe
                     page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
                     

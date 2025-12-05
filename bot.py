@@ -40,7 +40,6 @@ logging.getLogger("lncrawl").setLevel(logging.WARNING)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # [SPEED OPTIMIZATION]
-# 60 Threads per novel + 10 Concurrent Novels = 600 concurrent requests.
 THREADS_PER_NOVEL = 60
 MAX_CONCURRENT_NOVELS = 10
 
@@ -71,20 +70,14 @@ logger = logging.getLogger(__name__)
 pending_uploads = {}
 
 # --- WORKER INITIALIZER ---
-# Runs ONCE per process to load sources and config. 
-# Saves massive CPU/IO compared to loading per-novel.
 def worker_initializer():
     load_sources()
-    
-    # Configure global args for this process
     args = get_args()
     args.suppress = True
-    args.ignore_images = False # Ensure images are downloaded
+    args.ignore_images = False 
 
-# --- WORKER FUNCTION (Global Scope for Multiprocessing) ---
+# --- WORKER FUNCTION ---
 def scrape_logic_worker(url, progress_queue):
-    # Note: load_sources() is now handled by worker_initializer
-    
     app = App()
     try:
         if progress_queue: progress_queue.put("🔍 Fetching info...")
@@ -98,8 +91,7 @@ def scrape_logic_worker(url, progress_queue):
             app.crawler.init_executor(THREADS_PER_NOVEL)
 
             # 2. Inject Aggressive Connection Pool
-            # This is critical for 60 threads to actually work without blocking
-            if hasattr(app.crawler, 'scraper'):
+            if hasattr(app.crawler, 'scraper') and hasattr(app.crawler.scraper, 'mount'):
                 adapter = HTTPAdapter(
                     pool_connections=THREADS_PER_NOVEL, 
                     pool_maxsize=THREADS_PER_NOVEL,
@@ -109,16 +101,17 @@ def scrape_logic_worker(url, progress_queue):
                 app.crawler.scraper.mount("https://", adapter)
                 app.crawler.scraper.mount("http://", adapter)
 
-        # Cover Image
+        # [FIXED] Cover Image - Removed hardcoded headers that caused 403
         if app.crawler.novel_cover:
             try:
-                headers = {"Referer": "https://www.fanmtl.com/", "User-Agent": "Mozilla/5.0"}
-                response = app.crawler.scraper.get(app.crawler.novel_cover, headers=headers, timeout=15)
+                # We use the crawler's scraper which HAS the valid cookies/headers
+                response = app.crawler.scraper.get(app.crawler.novel_cover, timeout=15)
                 if response.status_code == 200:
                     cover_path = os.path.abspath(os.path.join(app.output_path, 'cover.jpg'))
                     with open(cover_path, 'wb') as f: f.write(response.content)
                     app.book_cover = cover_path
-            except: pass
+            except Exception as e: 
+                pass
 
         app.chapters = app.crawler.chapters[:]
         if not app.chapters:
@@ -130,14 +123,12 @@ def scrape_logic_worker(url, progress_queue):
         total = len(app.chapters)
         if progress_queue: progress_queue.put(f"⬇️ Downloading {total} chapters...")
         
-        # Download Loop
         count = 0
         for i, _ in enumerate(app.start_download()):
             count += 1
             if app.novel_status == "HALTED":
                 raise Exception(f"HALTED: {app.novel_status}")
 
-            # Update queue less frequently to save overhead (every 25 chaps)
             if count % 25 == 0 and progress_queue: 
                 progress_queue.put(f"🚀 {int(app.progress)}% ({i}/{total})")
         
@@ -160,69 +151,48 @@ def scrape_logic_worker(url, progress_queue):
 
 class NovelBot:
     def __init__(self):
-        # [SPEED] Use ProcessPool with Initializer
         self.executor = ProcessPoolExecutor(
             max_workers=MAX_CONCURRENT_NOVELS,
             initializer=worker_initializer
         )
         self.manager = multiprocessing.Manager()
-        
         self.userbot = None
         self.bot_username = None 
-        
-        # Lists
         self.processed = set()
         self.errors = {}
         self.nullcon = set()
         self.genfail = set()
         self.nwerror = set()
-        
         self.target_topic_id = int(FORCE_TARGET_TOPIC_ID) if FORCE_TARGET_TOPIC_ID else None
         self.error_topic_id = int(FORCE_ERROR_TOPIC_ID) if FORCE_ERROR_TOPIC_ID else None
         self.backup_topic_id = None
-
         self.files = {}
 
     def get_file_path(self, name):
-        """Generates a namespaced file path: data/name_BotUsername.json"""
         return os.path.join(DATA_DIR, f"{name}_{self.bot_username}.json")
 
     def load_data(self):
-        """Loads data with verbose error logging and migration support"""
-        
-        # --- 1. Load Processed Novels ---
         if os.path.exists(self.files['processed']):
             try:
                 with open(self.files['processed'], 'r') as f: self.processed = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Processed Failed: {e}")
-        elif os.path.exists(os.path.join(DATA_DIR, "processed.json")):
-            try:
-                with open(os.path.join(DATA_DIR, "processed.json"), 'r') as f: 
-                    self.processed = set(json.load(f))
-                logger.info("♻️ Migrated processed.json")
-            except Exception as e: logger.error(f"⚠️ Legacy Processed Load Failed: {e}")
 
-        # --- 2. Load Errors ---
         if os.path.exists(self.files['errors']):
             try:
                 with open(self.files['errors'], 'r') as f: self.errors = json.load(f)
             except Exception as e: logger.error(f"⚠️ Load Errors Failed: {e}")
 
-        # --- 3. Load Null Content ---
         if os.path.exists(self.files['nullcon']):
             try:
                 with open(self.files['nullcon'], 'r') as f: self.nullcon = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Nullcon Failed: {e}")
 
-        # --- 4. Load Genfail ---
         if os.path.exists(self.files['genfail']):
             try:
                 with open(self.files['genfail'], 'r') as f: self.genfail = set(json.load(f))
             except Exception as e: logger.error(f"⚠️ Load Genfail Failed: {e}")
 
-        # --- 5. Load Topics (Critical) ---
         if not self.target_topic_id or not self.error_topic_id:
-            loaded = False
             if os.path.exists(self.files['topics']):
                 try:
                     with open(self.files['topics'], 'r') as f:
@@ -230,23 +200,8 @@ class NovelBot:
                         if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
                         if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
                         self.backup_topic_id = data.get("backup_topic_id")
-                        loaded = True
-                        logger.info(f"✅ Loaded Topics from {os.path.basename(self.files['topics'])}")
                 except Exception as e: 
-                    logger.error(f"❌ CRITICAL: Found {self.files['topics']} but could not read it: {e}")
-
-            if not loaded:
-                legacy_path = os.path.join(DATA_DIR, "topics.json")
-                if os.path.exists(legacy_path):
-                    try:
-                        with open(legacy_path, 'r') as f:
-                            data = json.load(f)
-                            if not self.target_topic_id: self.target_topic_id = data.get("target_topic_id")
-                            if not self.error_topic_id: self.error_topic_id = data.get("error_topic_id")
-                            self.backup_topic_id = data.get("backup_topic_id")
-                            logger.info(f"♻️ Migrated Topics from legacy topics.json")
-                    except Exception as e: 
-                        logger.error(f"❌ CRITICAL: Found legacy topics.json but could not read it: {e}")
+                    logger.error(f"❌ CRITICAL: Found topics file but could not read it: {e}")
 
     def save_topics(self):
         try:
@@ -256,19 +211,15 @@ class NovelBot:
                     "error_topic_id": self.error_topic_id,
                     "backup_topic_id": self.backup_topic_id
                 }, f, indent=2)
-            logger.info(f"💾 Topics Saved to {os.path.basename(self.files['topics'])}")
         except Exception as e:
             logger.error(f"❌ Could not save topics: {e}")
 
     def save_success(self, url):
         self.processed.add(url)
         if url in self.errors: del self.errors[url]
-        
-        # Remove from bad lists
         if url in self.nullcon: self.nullcon.remove(url)
         if url in self.genfail: self.genfail.remove(url)
         
-        # Save Processed
         try:
             with open(self.files['processed'], 'w') as f: 
                 json.dump(list(self.processed), f, indent=2)
@@ -279,20 +230,17 @@ class NovelBot:
 
     def save_errors(self):
         try:
-            with open(self.files['errors'], 'w') as f: 
-                json.dump(self.errors, f, indent=2)
+            with open(self.files['errors'], 'w') as f: json.dump(self.errors, f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Errors Failed: {e}")
 
     def save_nullcon(self):
         try:
-            with open(self.files['nullcon'], 'w') as f: 
-                json.dump(list(self.nullcon), f, indent=2)
+            with open(self.files['nullcon'], 'w') as f: json.dump(list(self.nullcon), f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Nullcon Failed: {e}")
 
     def save_genfail(self):
         try:
-            with open(self.files['genfail'], 'w') as f: 
-                json.dump(list(self.genfail), f, indent=2)
+            with open(self.files['genfail'], 'w') as f: json.dump(list(self.genfail), f, indent=2)
         except Exception as e: logger.error(f"⚠️ Save Genfail Failed: {e}")
 
     def save_error(self, url, error_msg):
@@ -319,19 +267,16 @@ class NovelBot:
         if TARGET_GROUP_ID and ERROR_GROUP_ID:
             try:
                 if not self.target_topic_id:
-                    logger.info("🆕 Creating Target Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=TARGET_GROUP_ID, name=f"📚 {self.bot_username} Novels")
                     self.target_topic_id = topic.message_thread_id
                     self.save_topics()
                 
                 if not self.error_topic_id:
-                    logger.info("🆕 Creating Error/Log Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🛠 {self.bot_username} Logs")
                     self.error_topic_id = topic.message_thread_id
                     self.save_topics()
 
                 if not self.backup_topic_id:
-                    logger.info("🆕 Creating Backup Topic...")
                     topic = await application.bot.create_forum_topic(chat_id=ERROR_GROUP_ID, name=f"🗄️ {self.bot_username} Backup")
                     self.backup_topic_id = topic.message_thread_id
                     self.save_topics()
@@ -354,19 +299,11 @@ class NovelBot:
 
         asyncio.create_task(self.backup_loop(application.bot))
         
-        # Process Queue
         if os.path.exists(self.files['queue']):
             try:
                 with open(self.files['queue'], 'r') as f: data = json.load(f)
                 urls = data.get("urls", [])
-                
-                # Filter: processed, nullcon, genfail are skipped.
-                to_process = [
-                    u for u in urls 
-                    if u not in self.processed 
-                    and u not in self.nullcon 
-                    and u not in self.genfail
-                ]
+                to_process = [u for u in urls if u not in self.processed and u not in self.nullcon and u not in self.genfail]
                 
                 if to_process:
                     await self.send_log(application.bot, f"🔄 **Restarted**\nResuming {len(to_process)} novels...")
@@ -374,11 +311,8 @@ class NovelBot:
                 elif urls:
                      await self.send_log(application.bot, "ℹ️ Queue exists but all novels processed/skipped. Clearing.")
                      os.remove(self.files['queue'])
-
             except Exception as e:
                 logger.error(f"❌ Error processing queue file: {e}")
-        else:
-            logger.info("ℹ️ No pending queue found.")
 
     async def send_log(self, bot, text, edit_msg=None):
         if ERROR_GROUP_ID and self.error_topic_id:
@@ -429,8 +363,8 @@ class NovelBot:
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("backup", self.cmd_force_backup))
+        app.add_handler(CommandHandler("rmp", self.cmd_rmp)) # NEW COMMAND
         app.add_handler(MessageHandler(filters.Document.MimeType("application/json"), self.handle_json_file))
-        # Handler for receiving files from Userbot
         app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, self.handle_bot_dm))
         
         load_sources()
@@ -449,13 +383,36 @@ class NovelBot:
             if os.path.exists(f): os.remove(f)
         await update.message.reply_text("🗑️ History Reset.")
 
+    # [NEW] Remove from Processed Command
+    async def cmd_rmp(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        urls = context.args
+        if not urls:
+            await update.message.reply_text("⚠️ Usage: /rmp <url1> <url2> ...")
+            return
+        
+        removed_count = 0
+        for url in urls:
+            if url in self.processed:
+                self.processed.remove(url)
+                removed_count += 1
+        
+        if removed_count > 0:
+            try:
+                with open(self.files['processed'], 'w') as f: 
+                    json.dump(list(self.processed), f, indent=2)
+                await update.message.reply_text(f"✅ Removed {removed_count} novels from history.")
+            except Exception as e: 
+                logger.error(f"⚠️ Save Processed Failed: {e}")
+                await update.message.reply_text(f"❌ Error saving file: {e}")
+        else:
+             await update.message.reply_text("⚠️ URLs not found in history.")
+
     async def cmd_force_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Starting manual backup...")
         await self.perform_backup(context.bot)
         await update.message.reply_text("✅ Backup sent to logs group.")
 
     async def handle_bot_dm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # [HANDSHAKE] Catches file from Userbot, extracts UID from caption, and resolves Future
         uid = update.message.caption
         if uid and uid in pending_uploads:
             pending_uploads[uid].set_result(update.message.document.file_id)
@@ -496,7 +453,6 @@ class NovelBot:
         await self.send_log(bot, f"📥 **Starting Batch**\nQueue: {len(to_process)}\n(Skipped: {skipped})")
         
         for url in to_process:
-            # Double check
             if url in self.processed: continue
             await self.process_novel(url, bot)
             gc.collect()
@@ -511,7 +467,6 @@ class NovelBot:
         loop = asyncio.get_running_loop()
         start_time = time.time()
         
-        # ONE SHOT execution via ProcessPool
         future = loop.run_in_executor(self.executor, scrape_logic_worker, url, progress_queue)
         
         last_text = ""
@@ -535,7 +490,6 @@ class NovelBot:
             duration = int(time.time() - start_time)
             
             if epub_path and os.path.exists(epub_path):
-                # --- SUCCESS ---
                 file_size_mb = os.path.getsize(epub_path) / (1024 * 1024)
                 caption = f"📕 {os.path.basename(epub_path)}\n📦 {file_size_mb:.1f}MB | ⏱️ {duration}s"
                 try: await status_msg.delete()
@@ -544,81 +498,39 @@ class NovelBot:
                 dest_chat_id = TARGET_GROUP_ID if TARGET_GROUP_ID else ERROR_GROUP_ID
                 dest_topic_id = self.target_topic_id
 
-                if not dest_chat_id or not dest_topic_id:
-                    await self.send_log(bot, f"❌ Configuration Error: Target Group/Topic missing for {url}")
-                    return
-
-                # --- UPLOAD STRATEGY ---
                 if file_size_mb > USERBOT_THRESHOLD and self.userbot:
-                    # Case 1: Large File -> Userbot Handshake
                     prog_msg = await self.send_log(bot, f"🚀 Uploading {file_size_mb:.1f}MB via Userbot...")
-                    
                     uid = uuid.uuid4().hex
                     upload_future = loop.create_future()
                     pending_uploads[uid] = upload_future
-
                     try:
-                        # 1. Resolve Peer (Avoid PEER_ID_INVALID)
-                        try:
-                            # Try resolving by username first
-                            receiver = await self.userbot.get_users(self.bot_username)
-                        except Exception:
-                            # Fallback if @ is needed
-                            receiver = await self.userbot.get_users(f"@{self.bot_username}")
-                        
-                        # 2. Upload to BOT'S PM using the Userbot
-                        # We send the UID as caption to identify the file in handle_bot_dm
-                        await self.userbot.send_document(
-                            chat_id=receiver.id, 
-                            document=epub_path,
-                            caption=uid
-                        )
-
-                        # 3. Wait for the main bot to receive the file in handle_bot_dm and set the future
+                        try: receiver = await self.userbot.get_users(self.bot_username)
+                        except: receiver = await self.userbot.get_users(f"@{self.bot_username}")
+                        await self.userbot.send_document(chat_id=receiver.id, document=epub_path, caption=uid)
                         file_id = await asyncio.wait_for(upload_future, timeout=600)
-
-                        # 4. Send the file using the valid file_id (cached on Telegram servers)
-                        await bot.send_document(
-                            chat_id=dest_chat_id, 
-                            message_thread_id=dest_topic_id, 
-                            document=file_id,
-                            caption=caption
-                        )
-
+                        await bot.send_document(chat_id=dest_chat_id, message_thread_id=dest_topic_id, document=file_id, caption=caption)
                         await prog_msg.delete()
                         self.save_success(url)
-                    except asyncio.TimeoutError:
-                        await self.send_log(bot, "❌ Userbot Upload Timed Out (Bot didn't receive file)", edit_msg=prog_msg)
-                        self.save_error(url, "Userbot Upload Timeout")
                     except Exception as e:
                         await self.send_log(bot, f"❌ Userbot Upload Failed: {e}", edit_msg=prog_msg)
                         self.save_error(url, f"Userbot Upload Failed: {e}")
-                
                 else:
-                    # Case 2: Small File or No Userbot
                     if file_size_mb >= 50 and file_size_mb > USERBOT_THRESHOLD:
-                        await self.send_log(bot, f"❌ File {file_size_mb:.1f}MB exceeds {USERBOT_THRESHOLD}MB limit and Userbot is not active/configured.")
+                        await self.send_log(bot, f"❌ File > 50MB & No Userbot.")
                         self.save_error(url, "File > 50MB & No Userbot")
                     else:
                         with open(epub_path, 'rb') as f:
-                            await bot.send_document(
-                                chat_id=dest_chat_id,
-                                message_thread_id=dest_topic_id,
-                                document=f,
-                                caption=caption
-                            )
+                            await bot.send_document(chat_id=dest_chat_id, message_thread_id=dest_topic_id, document=f, caption=caption)
                         self.save_success(url)
-
                 os.remove(epub_path)
             else:
-                # Genfail (No file)
                 self.genfail.add(url)
                 self.save_genfail()
                 await self.send_log(bot, f"❌ Gen Failed: {url}", edit_msg=status_msg)
 
         except Exception as e:
             err_msg = str(e)
-            if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg or "No chapters found" in err_msg:
+            if "list index out of range" in err_msg or "IndexError" in err_msg or "No chapters extracted" in err_msg:
                 self.nullcon.add(url)
                 self.save_nullcon()
                 await self.send_log(bot, f"⚠️ **Null Content:** {url}", edit_msg=status_msg)
