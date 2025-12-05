@@ -2,6 +2,8 @@
 import logging
 import time
 import requests
+from urllib.parse import urlparse, parse_qs  # <--- ADDED MISSING IMPORTS
+from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
@@ -20,8 +22,6 @@ class FanMTLCrawler(Crawler):
         self.init_executor(60) 
         
         # 1. Setup the RUNNER (Standard Requests)
-        # We use standard requests because it is STABLE and FAST.
-        # It relies on cookies from Selenium to bypass Cloudflare.
         self.runner = requests.Session()
         
         self.runner.headers.update({
@@ -31,7 +31,7 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Force traffic through WARP (socks5h = Remote DNS resolution to prevent leaks)
+        # Force traffic through WARP
         self.proxy_url = "socks5h://127.0.0.1:40000"
         self.runner.proxies = {
             "http": self.proxy_url,
@@ -56,13 +56,11 @@ class FanMTLCrawler(Crawler):
         try:
             # 1. Configure Chrome to use WARP
             options = ChromeOptions()
-            # Essential for running in Docker
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument(f'--proxy-server={self.proxy_url}')
             
             # 2. Start Browser (Headless)
-            # Uses lncrawl's existing webdriver helper
             driver = create_local(headless=True, options=options)
             
             # 3. Visit Page
@@ -80,7 +78,6 @@ class FanMTLCrawler(Crawler):
             
             found_cf = False
             for cookie in cookies:
-                # Inject into our Fast Runner
                 self.runner.cookies.set(
                     cookie['name'], 
                     cookie['value'], 
@@ -90,7 +87,6 @@ class FanMTLCrawler(Crawler):
                 if cookie['name'] == 'cf_clearance':
                     found_cf = True
             
-            # Sync User-Agent to match the browser exactly
             if ua:
                 self.runner.headers['User-Agent'] = ua
             
@@ -102,22 +98,26 @@ class FanMTLCrawler(Crawler):
             
         except Exception as e:
             logger.critical(f"❌ Browser Solver Failed: {e}")
-            # If selenium fails, we can't do much.
             pass 
         finally:
             if driver:
                 try: driver.quit()
                 except: pass
 
-    def get_soup_safe(self, url):
+    def get_soup_safe(self, url, headers=None):
         """
         Smart wrapper: Fails fast -> Calls Solver -> Retries
         """
         retries = 0
         while True:
             try:
+                # Merge specific headers (like AJAX) with session headers
+                req_headers = self.runner.headers.copy()
+                if headers:
+                    req_headers.update(headers)
+
                 # STEP 1: Try Fast Runner
-                response = self.runner.get(url, timeout=15)
+                response = self.runner.get(url, headers=req_headers, timeout=15)
                 
                 # Check for Challenge Page
                 if response.status_code in [403, 503] and "just a moment" in response.text.lower():
@@ -138,14 +138,12 @@ class FanMTLCrawler(Crawler):
                     logger.error(f"Permanent Error (404): {url}")
                     return self.make_soup("<html></html>")
 
-                # If requests fail (connection refused, etc), retry a few times
                 if retries < 3:
                     logger.warning(f"Request Error: {e}. Retrying...")
                     time.sleep(3)
                     retries += 1
                     continue
                 
-                # If it persists, just return empty so bot doesn't crash
                 logger.error(f"Failed to fetch {url} after retries.")
                 return self.make_soup("<html></html>")
 
@@ -187,21 +185,19 @@ class FanMTLCrawler(Crawler):
                 href = last_page.get("href")
                 common_url = self.absolute_url(href).split("?")[0]
                 query = parse_qs(urlparse(href).query)
+                
                 page_params = query.get("page", ["0"])
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
                 
+                # AJAX Header is required for pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    # Manually pass AJAX header to runner
-                    try:
-                        resp = self.runner.get(url, headers=ajax_headers, timeout=15)
-                        page_soup = self.make_soup(resp)
-                        self.parse_chapter_list(page_soup)
-                    except:
-                        pass
+                    # Pass AJAX header to get_soup_safe
+                    page_soup = self.get_soup_safe(url, headers=ajax_headers)
+                    self.parse_chapter_list(page_soup)
                     
             except Exception as e:
                 logger.error(f"Pagination failed: {e}")
