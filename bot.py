@@ -42,7 +42,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 # [SPEED OPTIMIZATION]
 # 60 Threads per novel + 10 Concurrent Novels = 600 concurrent requests.
 THREADS_PER_NOVEL = 60
-MAX_CONCURRENT_NOVELS = 10
+MAX_CONCURRENT_NOVELS = 8
 
 # Group Configs (Must be -100xxxx format)
 TARGET_GROUP_ID = os.getenv("TARGET_GROUP_ID") 

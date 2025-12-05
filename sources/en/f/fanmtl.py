@@ -38,7 +38,7 @@ class FanMTLCrawler(Crawler):
 
         # Retry logic
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=5, pool_maxsize=10, max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=3, pool_maxsize=8, max_retries=retry)
         self.scraper.mount("https://", adapter)
         self.scraper.mount("http://", adapter)
         
