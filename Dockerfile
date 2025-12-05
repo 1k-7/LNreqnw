@@ -2,6 +2,7 @@
 FROM python:3.10-slim
 
 # 1. Install system build dependencies AND jemalloc for memory optimization
+# [ADDED] chromium and chromium-driver are required for the Selenium Cloudflare Solver
 RUN apt-get update && apt-get install -y \
 gcc \
 g++ \
@@ -13,6 +14,8 @@ libjpeg-dev \
 libffi-dev \
 libssl-dev \
 libjemalloc2 \
+chromium \
+chromium-driver \
 && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
@@ -27,7 +30,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 4. Copy project files
 COPY . .
-
 # 5. IMPORTANT: Optimization Flags
 # Switch to production to reduce logging/caching overhead
 ENV LNCRAWL_MODE="production"
