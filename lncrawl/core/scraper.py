@@ -49,25 +49,23 @@ class Scraper(TaskManager, SoupMaker):
         self.make_soup = self._soup_tool.make_soup  # type:ignore
 
     def init_scraper(self, session: Optional[Session] = None):
-        """Check for option: https://github.com/VeNoMouS/cloudscraper"""
         try:
             self.scraper = create_scraper(
-                # [SPEED FIX] Enable solving, but don't slow down requests
+                # [TURBO FIX] Allow 403 retries (required) but make them fast
                 auto_refresh_on_403=True, 
                 max_403_retries=3,             
 
-                # TURBO SETTINGS
-                min_request_interval=0,        # No delay between requests
-                max_concurrent_requests=50,    # Allow high concurrency
+                # [TURBO FIX] Zero delay, High Concurrency
+                min_request_interval=0,        
+                max_concurrent_requests=100,     
                 rotate_tls_ciphers=True,       
                 session_refresh_interval=900,  
 
-                # Disable artificial stealth delays
                 enable_stealth=True,
                 stealth_options={
-                    'min_delay': 0,            # 0 seconds delay
-                    'max_delay': 0,            # 0 seconds delay
-                    'human_like_delays': False, # Disable human emulation
+                    'min_delay': 0,            
+                    'max_delay': 0,            
+                    'human_like_delays': False, 
                     'randomize_headers': True,
                     'browser_quirks': True
                 },
@@ -79,6 +77,15 @@ class Scraper(TaskManager, SoupMaker):
                     'mobile': False,
                 },
             )
+            
+            # [CRITICAL SPEED HACK]
+            # Cloudscraper creates custom adapters (CipherSuiteAdapter). 
+            # We must manually boost their pool size to allow parallel downloads.
+            if hasattr(self.scraper, 'adapters'):
+                for adapter in self.scraper.adapters.values():
+                    adapter.pool_connections = 100
+                    adapter.pool_maxsize = 100
+                    
         except Exception:
             logger.exception("Failed to initialize cloudscraper")
             self.scraper = session or Session()

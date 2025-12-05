@@ -18,8 +18,8 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [SPEED FIX] Increased threads to 40 for concurrent downloading
-        self.init_executor(40) 
+        # [TURBO FIX] Massive worker pool for speed
+        self.init_executor(80) 
         
         random_ua = random.choice(user_agents)
         
@@ -30,13 +30,12 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Ensure proxy is set (using 40000 as per your setup)
         self.scraper.proxies.update({
             'http': 'socks5://127.0.0.1:40000',
             'https': 'socks5://127.0.0.1:40000',
         })
         
-        logger.info(f"FanMTL TURBO: UA -> {random_ua[:30]}... | Threads -> 40")
+        logger.info(f"FanMTL TURBO: UA -> {random_ua[:30]}... | Threads -> 80")
         self.cleaner.bad_css.update({'div[align="center"]'})
         
     def get_soup_safe(self, url, headers=None):
@@ -56,9 +55,9 @@ class FanMTLCrawler(Crawler):
                     return self.make_soup("<html><body></body></html>")
                 
                 if "403" in msg or "challenge" in msg:
-                    # Reduced wait time to 30s for speed
-                    logger.critical(f"403/Challenge on {url}. Retrying in 30s...")
-                    time.sleep(30) 
+                    # [SPEED FIX] Reduced wait time significantly
+                    logger.critical(f"403/Challenge on {url}. Retrying in 10s...")
+                    time.sleep(10) 
                     continue 
                 
                 logger.warning(f"Connection Error: {e}. Retrying in 5s...")
@@ -153,8 +152,8 @@ class FanMTLCrawler(Crawler):
                     return "<p><i>[Chapter content unavailable from source]</i></p>"
 
                 empty_retry_count += 1
-                # [SPEED FIX] Reduced retry sleep
-                time.sleep(1)
+                # [SPEED FIX] Minimal sleep for soft failures
+                time.sleep(0.1)
                 continue 
                 
             except Exception as e:
