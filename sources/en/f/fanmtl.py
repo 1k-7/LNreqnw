@@ -1,12 +1,10 @@
-# sources/en/f/fanmtl.py
 # -*- coding: utf-8 -*-
 import logging
 import time
+import random
 import requests.exceptions
-# REMOVED: import requests (not needed, we use self.scraper)
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
-# REMOVED: HTTPAdapter, Retry (Cloudscraper handles this internaly now)
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
@@ -22,15 +20,47 @@ class FanMTLCrawler(Crawler):
 
     def initialize(self):
         # Reduced max_workers for low RAM usage
-        self.init_executor(8) 
+        self.init_executor(5) 
         
-        # [CRITICAL FIX] DO NOT run self.scraper = requests.Session()
-        # We use the existing self.scraper which has Cloudflare protection.
-        
-        # Add headers to the existing scraper
+        # Hardcoded list of modern User-Agents to rotate through
+        user_agents = [
+            # Chrome on Windows 10/11
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            
+            # Chrome on MacOS
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            
+            # Firefox on Windows
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            
+            # Firefox on MacOS
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
+            
+            # Edge on Windows
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+            
+            # Safari on MacOS
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        ]
+
+        # Pick one randomly
+        selected_ua = random.choice(user_agents)
+        logger.info(f"FanMTL Random UA: {selected_ua}")
+
+        # Apply headers
         self.scraper.headers.update({
+            "User-Agent": selected_ua,
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.fanmtl.com/", # Helping valid requests
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
 
@@ -114,7 +144,7 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
 
-                # AJAX Header is crucial for pagination
+                # AJAX Header is crucial for pagination ONLY
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
@@ -166,6 +196,5 @@ class FanMTLCrawler(Crawler):
                 continue 
                 
             except Exception as e:
-                # Specific exception handling is done inside get_soup_safe
-                # If it bubble up here, it's a major crash or manual halt
+                # If get_soup_safe raises an exception (like 403 halt), we let it propagate
                 raise e
