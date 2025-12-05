@@ -68,3 +68,5 @@ lxml-stubs
 #tg 50mb
 pyrogram
 tgcrypto
+
+curl_cffi>=0.7.0

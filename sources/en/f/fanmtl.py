@@ -2,80 +2,82 @@
 import logging
 import time
 import random
-import requests.exceptions
-import requests
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
-from lncrawl.assets.user_agents import user_agents
+
+# Try to import curl_cffi for the bypass
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
 
 logger = logging.getLogger(__name__)
-
-HALT_403_SIGNAL = "MANUAL_RESTART_HALT_403"
 
 class FanMTLCrawler(Crawler):
     has_mtl = True
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] Increase threads for raw speed
+        if not HAS_CFFI:
+            raise Exception("Please install 'curl_cffi' to use this source: pip install curl_cffi")
+
+        # [TURBO] 60-80 threads is safe because we are impersonating a real browser
+        # and not using a slow proxy tunnel.
         self.init_executor(60) 
         
-        self.random_ua = random.choice(user_agents)
+        # 1. Replace the default scraper with a High-Performance Browser Session
+        # 'impersonate="chrome"' makes the TLS handshake look identical to a real browser.
+        self.scraper = cffi_requests.Session(impersonate="chrome")
         
-        # 1. Setup the SAFE Scraper (Uses WARP Proxy + Cloudscraper)
-        # This is slow but can bypass anything.
+        # 2. Add standard headers (User-Agent is handled automatically by impersonate)
         self.scraper.headers.update({
-            "User-Agent": self.random_ua,
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
         
-        self.warp_proxies = {
-            'http': 'socks5://127.0.0.1:40000',
-            'https': 'socks5://127.0.0.1:40000',
-        }
-        self.scraper.proxies.update(self.warp_proxies)
-
-        # 2. Setup the FAST Scraper (Direct Connection + Standard Requests)
-        # This bypasses WARP completely for maximum throughput.
-        self.fast_scraper = requests.Session()
-        self.fast_scraper.headers.update(self.scraper.headers)
+        # 3. Remove all proxies (Use Direct Connection for Max Speed)
+        self.scraper.proxies = {}
         
-        # IMPORTANT: NO PROXIES for the fast scraper
-        self.fast_scraper.proxies.clear() 
-        
-        # Optimize connection pooling for speed
-        adapter = requests.adapters.HTTPAdapter(pool_connections=60, pool_maxsize=60)
-        self.fast_scraper.mount("https://", adapter)
-        self.fast_scraper.mount("http://", adapter)
-        
-        logger.info(f"FanMTL HYBRID: UA -> {self.random_ua[:30]}... | Strategy -> Direct First, WARP Fallback")
+        logger.info(f"FanMTL NATIVE: TLS Impersonation Active (Chrome) | Proxy: Direct (Fast)")
         self.cleaner.bad_css.update({'div[align="center"]'})
         
-    def get_soup_safe(self, url, headers=None):
+    def get_soup_safe(self, url):
         """
-        Always use the SAFE scraper (WARP) for sensitive pages like 
-        Table of Contents and Pagination to avoid getting the main IP banned.
+        Wrapper to handle fetching with TLS Impersonation.
         """
+        retries = 0
         while True:
             try:
-                soup = self.get_soup(url, headers=headers)
-                if "just a moment" in str(soup.title).lower():
-                    raise Exception("Cloudflare Challenge Detected")
-                return soup
+                # Use the cffi scraper directly
+                response = self.scraper.get(url, timeout=10)
+                
+                # Handle Cloudflare specific responses
+                if response.status_code in [403, 503]:
+                    if "just a moment" in response.text.lower():
+                        logger.warning(f"Cloudflare Challenge on {url}. Retrying...")
+                        time.sleep(2)
+                        retries += 1
+                        if retries > 5: raise Exception("Cloudflare Loop")
+                        continue
+
+                response.raise_for_status()
+                
+                # Use the crawler's soup maker
+                return self.make_soup(response)
+
             except Exception as e:
                 msg = str(e).lower()
                 if "404" in msg:
                     logger.error(f"Permanent Error (404): {url}")
-                    return self.make_soup("<html><body></body></html>")
-                if "403" in msg or "challenge" in msg:
-                    logger.warning(f"403/Challenge on info page. Retrying via WARP in 10s...")
-                    time.sleep(10) 
-                    continue 
-                time.sleep(2)
+                    return self.make_soup("<html></html>")
+                
+                # Connection errors or temporary blocks
+                logger.warning(f"Request Error: {e}. Retrying in 5s...")
+                time.sleep(5)
                 continue
 
     def read_novel_info(self):
@@ -104,9 +106,11 @@ class FanMTLCrawler(Crawler):
 
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
-
+        
+        # Parse Current Page
         self.parse_chapter_list(soup)
 
+        # Handle Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -118,15 +122,22 @@ class FanMTLCrawler(Crawler):
                 page_params = query.get("page", ["0"])
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
-
+                
+                # AJAX Header needed for pagination scripts
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    page_soup = self.get_soup_safe(url, headers=ajax_headers)
-                    self.parse_chapter_list(page_soup)
+                    # We must use self.scraper.get directly to pass specific headers here
+                    try:
+                        resp = self.scraper.get(url, headers=ajax_headers, timeout=10)
+                        page_soup = self.make_soup(resp)
+                        self.parse_chapter_list(page_soup)
+                    except Exception as e:
+                        logger.error(f"Pagination fetch failed: {e}")
+
             except Exception as e:
-                logger.error(f"Pagination failed: {e}")
+                logger.error(f"Pagination logic error: {e}")
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
 
@@ -145,39 +156,39 @@ class FanMTLCrawler(Crawler):
 
     def download_chapter_body(self, chapter):
         """
-        HYBRID STRATEGY:
-        1. Try DIRECT connection (Fastest).
-        2. If 403/Block -> Fallback to WARP (Slow but Safe).
+        Downloads chapter content using the high-speed TLS-impersonating session.
         """
-        url = chapter["url"]
-        
-        # --- ATTEMPT 1: FAST (Direct Connection) ---
-        try:
-            # Timeout is short (5s) because we want to fail fast and switch to WARP if blocked
-            response = self.fast_scraper.get(url, timeout=5)
-            
-            # Check if Cloudflare blocked us
-            if response.status_code == 403 or "just a moment" in response.text.lower():
-                raise requests.exceptions.RequestException("Direct Access Blocked")
-            
-            response.raise_for_status()
-            soup = self.make_soup(response)
-            body = soup.select_one("#chapter-article .chapter-content")
-            content = self.cleaner.extract_contents(body).strip() if body else ""
-            
-            if content:
-                return content
+        retries = 0
+        while True:
+            try:
+                # Direct high-speed request
+                response = self.scraper.get(chapter["url"], timeout=10)
                 
-        except Exception:
-            # Silently ignore direct failure and proceed to WARP fallback
-            pass
+                # Basic error checking
+                if response.status_code == 404:
+                    return "<p><i>[Chapter link is broken (Error 404)]</i></p>"
+                
+                response.raise_for_status()
+                soup = self.make_soup(response)
+                
+                body = soup.select_one("#chapter-article .chapter-content")
+                content = self.cleaner.extract_contents(body).strip() if body else ""
+                
+                if content:
+                    return content
+                
+                if retries >= 2:
+                    return "<p><i>[Chapter content unavailable]</i></p>"
 
-        # --- ATTEMPT 2: SAFE (WARP Proxy) ---
-        try:
-            # This uses the 'scraper' object which has the WARP proxy configured
-            soup = self.get_soup_safe(url)
-            body = soup.select_one("#chapter-article .chapter-content")
-            return self.cleaner.extract_contents(body).strip() if body else ""
-        except Exception as e:
-            logger.error(f"Failed to download {url}: {e}")
-            return ""
+                retries += 1
+                time.sleep(1) # Tiny sleep on soft fail
+                
+            except Exception as e:
+                if "403" in str(e) or "challenge" in str(e).lower():
+                    logger.warning(f"Blocked on {chapter['title']}. Retrying...")
+                    time.sleep(5) # Wait a bit if blocked
+                    continue
+                    
+                logger.warning(f"Error on {chapter['title']}: {e}")
+                time.sleep(2)
+                continue
