@@ -7,7 +7,7 @@ from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
-from lncrawl.assets.user_agents import user_agents  # <--- Import your new list
+from lncrawl.assets.user_agents import user_agents
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +23,7 @@ class FanMTLCrawler(Crawler):
         # Reduced max_workers for low RAM usage
         self.init_executor(5) 
         
-        # [CRITICAL] Randomize User-Agent
-        # This ensures every run looks like a different browser/OS to Cloudflare
+        # 1. Randomize User-Agent
         random_ua = random.choice(user_agents)
         
         self.scraper.headers.update({
@@ -33,8 +32,16 @@ class FanMTLCrawler(Crawler):
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
+
+        # 2. [NEW] Force traffic through local WARP Proxy
+        # This sends bot traffic through Cloudflare network, bypassing IP bans
+        self.scraper.proxies.update({
+            'http': 'socks5://127.0.0.1:40000',
+            'https': 'socks5://127.0.0.1:40000',
+        })
         
-        logger.info(f"FanMTL Strategy: Using User-Agent -> {random_ua[:40]}...")
+        logger.info(f"FanMTL Strategy: User-Agent -> {random_ua[:30]}... | Proxy -> WARP (Port 40000)")
+
         self.cleaner.bad_css.update({'div[align="center"]'})
         
     def get_soup_safe(self, url, headers=None):
@@ -45,7 +52,7 @@ class FanMTLCrawler(Crawler):
                 soup = self.get_soup(url, headers=headers)
                 
                 if "just a moment" in str(soup.title).lower():
-                    raise Exception("Cloudflare Challenge Detected (Auto-solve failed)")
+                    raise Exception("Cloudflare Challenge Detected")
                 
                 return soup
             except Exception as e:
@@ -115,12 +122,10 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
 
-                # AJAX Header is crucial for pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
                     url = f"{common_url}?page={page}&wjm={wjm}"
-                    # Pass headers specifically to get_soup_safe
                     page_soup = self.get_soup_safe(url, headers=ajax_headers)
                     self.parse_chapter_list(page_soup)
                     
@@ -150,7 +155,7 @@ class FanMTLCrawler(Crawler):
         
         while True:
             try:
-                # Use get_soup_safe to leverage the cloudscraper protection + random UA
+                # Use get_soup_safe to leverage the cloudscraper protection + random UA + WARP Proxy
                 soup = self.get_soup_safe(chapter["url"])
                 body = soup.select_one("#chapter-article .chapter-content")
                 
