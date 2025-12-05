@@ -11,19 +11,16 @@ from lncrawl.assets.user_agents import user_agents
 
 logger = logging.getLogger(__name__)
 
-# --- GLOBAL SIGNAL FOR MANUAL RESTART HALT ---
 HALT_403_SIGNAL = "MANUAL_RESTART_HALT_403"
-# ---------------------------------------------
 
 class FanMTLCrawler(Crawler):
     has_mtl = True
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # Reduced max_workers for low RAM usage
-        self.init_executor(5) 
+        # [SPEED FIX] Increased threads to 40 for concurrent downloading
+        self.init_executor(40) 
         
-        # 1. Randomize User-Agent
         random_ua = random.choice(user_agents)
         
         self.scraper.headers.update({
@@ -32,23 +29,20 @@ class FanMTLCrawler(Crawler):
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
         })
-
-        # 2. [NEW] Force traffic through local WARP Proxy
-        # This sends bot traffic through Cloudflare network, bypassing IP bans
+        
+        # Ensure proxy is set (using 40000 as per your setup)
         self.scraper.proxies.update({
             'http': 'socks5://127.0.0.1:40000',
             'https': 'socks5://127.0.0.1:40000',
         })
         
-        logger.info(f"FanMTL Strategy: User-Agent -> {random_ua[:30]}... | Proxy -> WARP (Port 40000)")
-
+        logger.info(f"FanMTL TURBO: UA -> {random_ua[:30]}... | Threads -> 40")
         self.cleaner.bad_css.update({'div[align="center"]'})
         
     def get_soup_safe(self, url, headers=None):
-        """Wrapper to pause on errors during novel info / TOC fetching."""
+        """Wrapper with reduced wait times for speed"""
         while True:
             try:
-                # Use self.get_soup which uses the cloudscraper session
                 soup = self.get_soup(url, headers=headers)
                 
                 if "just a moment" in str(soup.title).lower():
@@ -58,27 +52,21 @@ class FanMTLCrawler(Crawler):
             except Exception as e:
                 msg = str(e).lower()
                 if "404" in msg:
-                    logger.error(f"Permanent Error (404) fetching {url}")
+                    logger.error(f"Permanent Error (404): {url}")
                     return self.make_soup("<html><body></body></html>")
                 
                 if "403" in msg or "challenge" in msg:
-                    logger.critical(f"403 Forbidden/Challenge on {url}. Waiting 60s...")
-                    time.sleep(60) 
+                    # Reduced wait time to 30s for speed
+                    logger.critical(f"403/Challenge on {url}. Retrying in 30s...")
+                    time.sleep(30) 
                     continue 
                 
-                if "429" in msg:
-                    logger.warning("Rate Limit (429). Sleeping 60s...")
-                    time.sleep(60)
-                    continue
-                
-                logger.warning(f"Connection Error: {e}. Retrying in 10s...")
-                time.sleep(10)
+                logger.warning(f"Connection Error: {e}. Retrying in 5s...")
+                time.sleep(5)
                 continue
 
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
-        
-        # 1. Main Page
         soup = self.get_soup_safe(self.novel_url)
 
         possible_title = soup.select_one("h1.novel-title")
@@ -105,10 +93,8 @@ class FanMTLCrawler(Crawler):
         self.chapters = []
         self.chapter_urls = set()
 
-        # 2. Parse initial chapters
         self.parse_chapter_list(soup)
 
-        # 3. Handle Pagination (Requires AJAX header)
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         
         if pagination_links:
@@ -155,7 +141,6 @@ class FanMTLCrawler(Crawler):
         
         while True:
             try:
-                # Use get_soup_safe to leverage the cloudscraper protection + random UA + WARP Proxy
                 soup = self.get_soup_safe(chapter["url"])
                 body = soup.select_one("#chapter-article .chapter-content")
                 
@@ -168,9 +153,9 @@ class FanMTLCrawler(Crawler):
                     return "<p><i>[Chapter content unavailable from source]</i></p>"
 
                 empty_retry_count += 1
-                time.sleep(2)
+                # [SPEED FIX] Reduced retry sleep
+                time.sleep(1)
                 continue 
                 
             except Exception as e:
-                # If get_soup_safe raises an exception (like 403 halt), we let it propagate
                 raise e

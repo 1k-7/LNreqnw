@@ -52,27 +52,26 @@ class Scraper(TaskManager, SoupMaker):
         """Check for option: https://github.com/VeNoMouS/cloudscraper"""
         try:
             self.scraper = create_scraper(
-                # [CRITICAL FIX] Enable auto-refresh to solve Cloudflare challenges
+                # [SPEED FIX] Enable solving, but don't slow down requests
                 auto_refresh_on_403=True, 
                 max_403_retries=3,             
 
-                # TLS & Concurrency settings
-                min_request_interval=2.0,      
-                max_concurrent_requests=1,     
+                # TURBO SETTINGS
+                min_request_interval=0,        # No delay between requests
+                max_concurrent_requests=50,    # Allow high concurrency
                 rotate_tls_ciphers=True,       
                 session_refresh_interval=900,  
 
-                # Stealth Options
+                # Disable artificial stealth delays
                 enable_stealth=True,
                 stealth_options={
-                    'min_delay': 1.0,          
-                    'max_delay': 3.0,
-                    'human_like_delays': True,
+                    'min_delay': 0,            # 0 seconds delay
+                    'max_delay': 0,            # 0 seconds delay
+                    'human_like_delays': False, # Disable human emulation
                     'randomize_headers': True,
                     'browser_quirks': True
                 },
 
-                # Browser Fingerprint
                 browser={
                     'browser': 'chrome',
                     'platform': 'windows',
