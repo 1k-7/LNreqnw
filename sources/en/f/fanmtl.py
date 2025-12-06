@@ -9,13 +9,14 @@ from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 from lncrawl.assets.user_agents import user_agents
 
-# Import Selenium
+# Import Selenium Components
 from lncrawl.webdriver.local import create_local
 from selenium.webdriver import ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,14 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50 threads for stability
-        self.init_executor(50) 
+        # [TURBO] 40 threads is the stability sweet spot for WARP
+        self.init_executor(40) 
         
         self.session_ua = random.choice(user_agents)
         
+        # 1. Setup the RUNNER (Standard Requests)
         self.runner = requests.Session()
+        
         self.runner.headers.update({
             "User-Agent": self.session_ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -38,7 +41,7 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Force traffic through WARP
+        # Force traffic through WARP (socks5h for remote DNS)
         self.proxy_url = "socks5h://127.0.0.1:40000"
         self.runner.proxies = {
             "http": self.proxy_url,
@@ -63,20 +66,18 @@ class FanMTLCrawler(Crawler):
                         if (host.shadowRoot) {
                             let checkbox = host.shadowRoot.querySelector('input[type="checkbox"]');
                             if (checkbox) { checkbox.click(); return true; }
-                            let button = host.shadowRoot.querySelector('button'); # Sometimes it's a button
-                            if (button) { button.click(); return true; }
                         }
                     }
                     return false;
                 }
                 clickShadow();
             """)
-        except:
-            pass
+        except: pass
 
     def open_browser_and_solve(self, url, return_html=False):
         """
         Launches a REAL browser and waits specifically for the CHAPTER LIST.
+        Fails hard if the content is not found (prevents 'No chapters found' error).
         """
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
@@ -84,7 +85,12 @@ class FanMTLCrawler(Crawler):
             options = ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
+            # Stealth flags
             options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-infobars")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+            
             options.add_argument(f'--proxy-server={self.proxy_url}')
             options.add_argument(f'--user-agent={self.session_ua}')
             
@@ -93,11 +99,13 @@ class FanMTLCrawler(Crawler):
             driver.get(url)
             
             # --- ROBUST SOLVER LOOP ---
-            # Try for up to 60 seconds to get the real content
             success = False
-            for attempt in range(6):
+            
+            # We try for 40 seconds to pass the challenge
+            for attempt in range(8):
                 try:
-                    # 1. Check if we are already good (Look for chapter list)
+                    # 1. Check if we are already good (Look for unique novel element)
+                    # 'ul.chapter-list' is the best indicator of success
                     WebDriverWait(driver, 5).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, "ul.chapter-list"))
                     )
@@ -105,38 +113,43 @@ class FanMTLCrawler(Crawler):
                     success = True
                     break
                 except TimeoutException:
-                    # 2. Not found yet. Check for Cloudflare frames/checkboxes
-                    logger.info(f"Browser: Content missing. Checking for challenge... ({attempt+1}/6)")
+                    # 2. Not found yet. Check for Cloudflare
+                    logger.info(f"Browser: Content missing. Checking for challenge... ({attempt+1}/8)")
                     
-                    # Try standard frame search
+                    # Try standard frame search & click
                     try:
                         iframes = driver.find_elements(By.TAG_NAME, "iframe")
                         for frame in iframes:
                             try:
                                 driver.switch_to.frame(frame)
-                                # Try checking for checkbox
                                 checkbox = driver.find_elements(By.XPATH, "//input[@type='checkbox']")
                                 if checkbox:
-                                    checkbox[0].click()
-                                    logger.info("Browser: Clicked standard checkbox.")
+                                    logger.info("Browser: Found checkbox. Moving mouse and clicking...")
+                                    # Use ActionChains for human-like click
+                                    actions = ActionChains(driver)
+                                    actions.move_to_element(checkbox[0]).pause(0.5).click().perform()
                                 driver.switch_to.default_content()
                             except:
                                 driver.switch_to.default_content()
                     except: pass
 
-                    # Try Shadow DOM clicker
+                    # Try Shadow DOM clicker (Fallback)
                     self.click_shadow_checkbox(driver)
                     
-                    # Wait a bit for reload
                     time.sleep(5)
 
             if not success:
-                logger.error("❌ Browser failed to reach novel content after 60s.")
-                # Fallback: Return whatever we have, maybe requests can handle it or it's a 404
-                # But mostly this means the solver failed.
+                # [CRITICAL] If we didn't find the chapter list, DO NOT return HTML.
+                # Raise exception so the bot knows it failed instead of saying "No chapters".
+                page_src = driver.page_source.lower()
+                if "access denied" in page_src or "error 1020" in page_src:
+                     raise Exception("Cloudflare IP Ban (Access Denied)")
+                
+                raise Exception("Solver Timeout: Could not bypass Cloudflare Challenge")
 
             # --- SYNC COOKIES ---
             cookies = driver.get_cookies()
+            found_cf = False
             for cookie in cookies:
                 self.runner.cookies.set(
                     cookie['name'], 
@@ -144,13 +157,19 @@ class FanMTLCrawler(Crawler):
                     domain=cookie.get('domain', ''),
                     path=cookie.get('path', '/')
                 )
+                if cookie['name'] == 'cf_clearance':
+                    found_cf = True
+            
+            if found_cf:
+                logger.info("✅ Cookies Synced. Turbo Runner is READY.")
             
             if return_html:
                 return driver.page_source
             
         except Exception as e:
-            logger.critical(f"❌ Browser Solver Crashed: {e}")
-            if return_html: return None
+            logger.critical(f"❌ Browser Solver Failed: {e}")
+            # Propagate error to trigger retry logic in caller
+            raise e
         finally:
             if driver:
                 try: driver.quit()
@@ -165,7 +184,7 @@ class FanMTLCrawler(Crawler):
 
                 response = self.runner.get(url, headers=req_headers, timeout=20)
                 
-                # [CRITICAL] Check CONTENT for challenge
+                # Check content for challenge (even if status 200)
                 page_text = response.text.lower()
                 if response.status_code in [403, 503] or "just a moment" in page_text or "verify you are human" in page_text:
                     if retries == 0:
@@ -182,7 +201,12 @@ class FanMTLCrawler(Crawler):
             except Exception as e:
                 msg = str(e).lower()
                 if "404" in msg:
+                    # Return empty soup for 404s
                     return self.make_soup("<html></html>")
+                
+                # For blocks, we must re-raise or retry differently
+                if "cloudflare" in msg or "ban" in msg:
+                    raise e 
 
                 if retries < 3:
                     logger.warning(f"Request Error: {e}. Retrying...")
@@ -196,25 +220,21 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        # [CRITICAL] Use Browser to fetch the Info Page + Chapters
-        # We expect the browser to wait until ul.chapter-list is present
-        html_content = self.open_browser_and_solve(self.novel_url, return_html=True)
-        
-        if not html_content:
-            logger.error("Failed to get HTML from browser. Fallback to requests...")
-            soup = self.get_soup_safe(self.novel_url)
-        else:
+        # Use Browser to get initial content (Guarantees we see the chapter list)
+        try:
+            html_content = self.open_browser_and_solve(self.novel_url, return_html=True)
             soup = self.make_soup(html_content)
+        except Exception as e:
+            logger.error(f"Failed to load novel info via browser: {e}")
+            return # Stop here, don't try to parse empty stuff
 
-        # --- PARSE INFO ---
         possible_title = soup.select_one("h1.novel-title")
         if not possible_title:
-            # If browser returned junk, force a raw request retry
-            logger.warning("⚠️ Title not found. Trying raw request...")
-            soup = self.get_soup_safe(self.novel_url)
-            possible_title = soup.select_one("h1.novel-title")
+            # If title missing despite solver success, something is wrong
+            logger.error(f"❌ Page loaded but Title not found. Content might be invalid.")
+            return
 
-        self.novel_title = possible_title.text.strip() if possible_title else "Unknown"
+        self.novel_title = possible_title.text.strip()
         
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
@@ -226,14 +246,15 @@ class FanMTLCrawler(Crawler):
         author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
         self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
 
+        summary_div = soup.select_one(".summary .content")
+        self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
+
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
-        # Parse chapters from the page we just got
         self.parse_chapter_list(soup)
 
-        # --- PAGINATION ---
-        # Now that we (hopefully) have valid cookies, use Requests for pagination
+        # Pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -257,7 +278,7 @@ class FanMTLCrawler(Crawler):
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
         
         if not self.chapters:
-            logger.error(f"❌ Critical: No chapters found for {self.novel_url}.")
+            logger.error(f"❌ No chapters found. Scraper failed to parse content.")
 
     def parse_chapter_list(self, soup):
         if not soup: return
