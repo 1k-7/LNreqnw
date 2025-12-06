@@ -12,6 +12,9 @@ from lncrawl.assets.user_agents import user_agents
 # Import Selenium
 from lncrawl.webdriver.local import create_local
 from selenium.webdriver import ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +23,9 @@ class FanMTLCrawler(Crawler):
     base_url = "https://www.fanmtl.com/"
 
     def initialize(self):
-        # [TURBO] 50-60 threads is the sweet spot
+        # [TURBO] 50 threads for stability + speed
         self.init_executor(50) 
         
-        # Pick a random User-Agent for this session
         self.session_ua = random.choice(user_agents)
         
         # 1. Setup the RUNNER (Standard Requests)
@@ -44,20 +46,19 @@ class FanMTLCrawler(Crawler):
             "https": self.proxy_url
         }
 
-        # Optimize connection pool
         adapter = requests.adapters.HTTPAdapter(pool_connections=60, pool_maxsize=60)
         self.runner.mount("https://", adapter)
         self.runner.mount("http://", adapter)
 
-        # Expose runner for cover image downloads
         self.scraper = self.runner
-
-        self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
         logger.info(f"FanMTL Init: UA -> {self.session_ua[:30]}... | Proxy -> WARP")
 
-    def refresh_cookies(self, url):
-        """Launches a REAL headless Chrome browser to solve the Cloudflare Challenge."""
+    def open_browser_and_solve(self, url, return_html=False):
+        """
+        Launches a REAL browser to solve Cloudflare.
+        Returns: HTML content of the page (if successful)
+        """
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
         try:
@@ -68,20 +69,42 @@ class FanMTLCrawler(Crawler):
             options.add_argument(f'--proxy-server={self.proxy_url}')
             options.add_argument(f'--user-agent={self.session_ua}')
             
+            # Create Browser
             driver = create_local(headless=True, options=options)
+            driver.set_page_load_timeout(60)
             driver.get(url)
             
-            # Wait specifically for the challenge
-            for i in range(5):
-                time.sleep(5)
+            # --- SOLVER LOGIC ---
+            # Wait for Cloudflare Challenge to appear or clear
+            time.sleep(5)
+            
+            # Check if we need to click "Verify you are human"
+            try:
+                # Look for Cloudflare iframe
+                iframe = driver.find_elements(By.XPATH, "//iframe[contains(@src, 'cloudflare')]")
+                if iframe:
+                    driver.switch_to.frame(iframe[0])
+                    # Try clicking the checkbox
+                    checkbox = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, "//input[@type='checkbox']"))
+                    )
+                    if checkbox:
+                        logger.info("Browser: Clicking Cloudflare Checkbox...")
+                        checkbox.click()
+                    driver.switch_to.default_content()
+            except:
+                pass
+
+            # Wait for Redirect
+            for i in range(10):
                 title = driver.title.lower()
                 if "just a moment" not in title and "verify" not in title and "cloudflare" not in title:
-                    logger.info("Browser: Page loaded successfully.")
+                    logger.info("Browser: Challenge Solved.")
                     break
-                logger.info(f"Browser: Solving challenge... ({i+1}/5)")
+                time.sleep(2)
 
+            # --- SYNC COOKIES ---
             cookies = driver.get_cookies()
-            
             found_cf = False
             for cookie in cookies:
                 self.runner.cookies.set(
@@ -94,30 +117,20 @@ class FanMTLCrawler(Crawler):
                     found_cf = True
             
             if found_cf:
-                logger.info("✅ Solver Success! Cookies synced.")
-                self.cookies_synced = True
+                logger.info("✅ Cookies Synced. Turbo Runner is READY.")
             else:
-                logger.warning("⚠️ Browser finished but 'cf_clearance' missing. (Continuing anyway)")
+                logger.warning("⚠️ 'cf_clearance' cookie not found. Connection might be unstable.")
+                
+            if return_html:
+                return driver.page_source
             
         except Exception as e:
             logger.critical(f"❌ Browser Solver Failed: {e}")
+            if return_html: return None
         finally:
             if driver:
                 try: driver.quit()
                 except: pass
-
-    def is_challenge_page(self, html_content):
-        """Detects Cloudflare challenges even if status is 200 OK"""
-        text = html_content.lower()
-        keywords = [
-            "just a moment...",
-            "verify you are human",
-            "enable javascript",
-            "security check",
-            "ray id:",
-            "challenge-platform"
-        ]
-        return any(k in text for k in keywords)
 
     def get_soup_safe(self, url, headers=None):
         retries = 0
@@ -129,16 +142,15 @@ class FanMTLCrawler(Crawler):
                 response = self.runner.get(url, headers=req_headers, timeout=20)
                 
                 # [CRITICAL] Check CONTENT for challenge
-                if response.status_code in [403, 503] or self.is_challenge_page(response.text):
+                page_text = response.text.lower()
+                if response.status_code in [403, 503] or "just a moment" in page_text or "verify you are human" in page_text:
                     if retries == 0:
-                        logger.warning("⛔ Silent Block Detected. Refreshing cookies...")
-                        self.refresh_cookies(url)
+                        logger.warning("⛔ Cloudflare Blocked Request. Refreshing cookies...")
+                        self.open_browser_and_solve(url)
                         retries += 1
                         continue
                     else:
-                        # If failing twice, maybe just return what we have (parsing might fail later)
-                        logger.error("Cloudflare Loop - Solver failed to bypass")
-                        raise Exception("Cloudflare Blocked")
+                        raise Exception("Cloudflare Loop")
 
                 response.raise_for_status()
                 return self.make_soup(response)
@@ -150,7 +162,7 @@ class FanMTLCrawler(Crawler):
 
                 if retries < 3:
                     logger.warning(f"Request Error: {e}. Retrying...")
-                    time.sleep(3)
+                    time.sleep(2)
                     retries += 1
                     continue
                 
@@ -160,23 +172,27 @@ class FanMTLCrawler(Crawler):
     def read_novel_info(self):
         logger.debug("Visiting %s", self.novel_url)
         
-        soup = self.get_soup_safe(self.novel_url)
+        # [CRITICAL CHANGE] 
+        # Use the Browser to get the initial page content directly.
+        # This bypasses the 200-OK challenge page that 'requests' sees.
+        html_content = self.open_browser_and_solve(self.novel_url, return_html=True)
+        
+        if not html_content:
+            logger.error("Failed to get HTML from browser. Fallback to requests...")
+            soup = self.get_soup_safe(self.novel_url)
+        else:
+            soup = self.make_soup(html_content)
 
-        # [CRITICAL FIX] Integrity Check
-        # If we parsed a page but found no title/chapters, it was likely a broken page/block.
-        # Force a refresh and retry.
+        # --- PARSE INFO ---
         possible_title = soup.select_one("h1.novel-title")
         if not possible_title:
-             logger.warning("⚠️ Invalid Page Content (No Title). Forcing Solver...")
-             self.refresh_cookies(self.novel_url)
-             soup = self.get_soup_safe(self.novel_url)
-             possible_title = soup.select_one("h1.novel-title")
+            # Integrity Check: If browser returned a challenge page, try requests as last resort
+            logger.warning("⚠️ Title not found in browser HTML. Checking requests...")
+            soup = self.get_soup_safe(self.novel_url)
+            possible_title = soup.select_one("h1.novel-title")
 
-        if possible_title:
-            self.novel_title = possible_title.text.strip()
-        else:
-            self.novel_title = soup.select_one('meta[property="og:title"]').get("content").strip() if soup.select_one('meta[property="og:title"]') else "Unknown"
-
+        self.novel_title = possible_title.text.strip() if possible_title else "Unknown"
+        
         img_tag = soup.select_one("figure.cover img") or soup.select_one(".fixed-img img")
         if img_tag:
             url = img_tag.get("src")
@@ -186,16 +202,15 @@ class FanMTLCrawler(Crawler):
 
         author_tag = soup.select_one('.novel-info .author span[itemprop="author"]')
         self.novel_author = author_tag.text.strip() if author_tag else "Unknown"
-
-        summary_div = soup.select_one(".summary .content")
-        self.novel_synopsis = summary_div.get_text("\n\n").strip() if summary_div else ""
-
+        
         self.volumes = [{"id": 1, "title": "Volume 1"}]
         self.chapters = []
 
+        # Parse chapters from the main page
         self.parse_chapter_list(soup)
 
-        # Pagination Logic
+        # --- PAGINATION ---
+        # Use the requests runner (which now has cookies) for pagination
         pagination_links = soup.select('.pagination a[data-ajax-update="#chpagedlist"]')
         if pagination_links:
             try:
@@ -218,9 +233,8 @@ class FanMTLCrawler(Crawler):
 
         self.chapters.sort(key=lambda x: x["id"] if isinstance(x, dict) else getattr(x, "id", 0))
         
-        # [FINAL CHECK] If still 0 chapters, error out clearly
         if not self.chapters:
-            logger.error(f"❌ Zero chapters found for {self.novel_url}")
+            logger.error(f"❌ Critical: No chapters found for {self.novel_url}. Page might be blocked.")
 
     def parse_chapter_list(self, soup):
         if not soup: return
